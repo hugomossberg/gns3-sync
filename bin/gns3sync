@@ -2313,8 +2313,35 @@ def cmd_init():
     export_input = input(f"Local path for Git export repository [{default_export}]: ").strip()
     export_dir = os.path.abspath(os.path.expanduser(export_input or default_export))
     
-    repo_input = input("Remote GitHub URL (SSH or HTTPS, e.g. git@github.com:user/my-lab.git): ").strip()
-    repo_url = repo_input
+    repo_url = ""
+    # Check if GitHub CLI (gh) is available and logged in
+    if check_cmd("gh"):
+        try:
+            gh_check = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+            gh_auth = gh_check.returncode == 0
+        except Exception:
+            gh_auth = False
+
+        if gh_auth:
+            print("\n✨ GitHub CLI detected on your system!")
+            auto_gh = input("Would you like GNS3Sync to automatically create a new PRIVATE GitHub repository for you? [Y/n]: ").strip().lower()
+            if auto_gh != "n":
+                default_name = "my-gns3-labs"
+                r_name = input(f"Enter repository name [{default_name}]: ").strip() or default_name
+                vis_choice = input("Repository visibility [private/public, default: private]: ").strip().lower()
+                vis_flag = "--public" if vis_choice == "public" else "--private"
+                print(f"Creating {vis_flag.replace('--', '')} repository '{r_name}' on your GitHub account...")
+                c_res = subprocess.run(["gh", "repo", "create", r_name, vis_flag, "--description", "Automated GNS3 Lab Documentation & Disaster Recovery"], capture_output=True, text=True)
+                if c_res.returncode == 0:
+                    v_res = subprocess.run(["gh", "repo", "view", r_name, "--json", "sshUrl", "-q", ".sshUrl"], capture_output=True, text=True)
+                    repo_url = v_res.stdout.strip()
+                    print(f"✅ Successfully created: {repo_url}")
+                else:
+                    print(f"⚠️ Could not create via gh CLI: {c_res.stderr.strip() or c_res.stdout.strip()}")
+
+    if not repo_url:
+        repo_input = input("Remote GitHub URL (SSH or HTTPS, e.g. git@github.com:youruser/my-lab.git): ").strip()
+        repo_url = repo_input
     repo_name = os.path.basename(repo_url).replace(".git", "") if repo_url else "gns3-topology"
     
     keyword_input = input("Primary project keyword/name (leave empty for auto-detect): ").strip()
