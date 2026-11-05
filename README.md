@@ -85,7 +85,15 @@ gns3sync init
 Follow the interactive prompts:
 * Specify your GNS3 projects folder (e.g. `~/GNS3/projects` or `/opt/gns3/projects`).
 * Set your local Git export directory (default: `~/gns3-export`).
-* Set your remote GitHub repository URL (SSH or HTTPS).
+* Provide your remote GitHub repository URL (SSH or HTTPS).
+
+> [!TIP]
+> **Connecting to GitHub without GitHub CLI (Super Simple):**
+> 1. Go to [github.com/new](https://github.com/new) in your browser.
+> 2. Choose a name (e.g. `my-gns3-labs`) and select **Private** (recommended).
+> 3. Click **Create repository**.
+> 4. Copy the URL (`git@github.com:username/my-gns3-labs.git` or HTTPS `https://github.com/username/my-gns3-labs.git`).
+> 5. Paste it into the `gns3sync init` wizard!
 
 ### 4. Verify Your Setup
 ```bash
