@@ -64,8 +64,8 @@ flowchart TD
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/hugomossberg/gns3sync.git
-cd gns3sync
+git clone https://github.com/hugomossberg/gns3-sync.git
+cd gns3-sync
 ```
 
 ### 2. Run the Universal Installer
@@ -100,43 +100,37 @@ Your GitHub repository will instantly be populated with full Mermaid topology di
 
 ---
 
-## 🔄 Switching Projects Easily (`gns3-switch`)
+## 📖 How-To Guides & Tutorials
 
-You can switch which GNS3 project is synchronized to your primary GitHub repository at any time:
+### Tutorial 1: Connecting your first GNS3 project to GitHub
+1. Open your lab in GNS3 (or check your projects folder).
+2. Run `gns3sync switch`:
+   ```bash
+   gns3-switch
+   ```
+3. Type the number corresponding to your project.
+4. GNS3Sync automatically parses your topology, creates the GitHub markdown, and pushes directly to your repository!
 
-### List All Available Projects
+### Tutorial 2: Reviving a crashed or wiped node in 10 seconds
+1. Open your GitHub repository in your browser.
+2. Scroll to the **⚡ Disaster Recovery & 1-Click Rollback** section.
+3. Click on the card for your crashed node (e.g., `🖥️ R1-Cisco`).
+4. Click the **Copy** button in the code block.
+5. In your GNS3 console, paste the snippet directly into the terminal. Your node is completely restored to its active working state!
+
+### Tutorial 3: Switching between different lab assignments
+If you have multiple courses or lab exercises:
 ```bash
+# List all your labs and see which one is currently on GitHub:
 gns3-switch list
-# or
-gns3sync list
+
+# Switch to your homework lab:
+gns3-switch labb2
+
+# Later, switch back to your group project:
+gns3-switch grupparbete
 ```
-
-Output:
-```text
-=== GNS3 Projects in /mnt/gns3-fast/projects ===
-   1) ⚪                      SNMP & LibreNMS
-   2) ⚪                      drift övning
-   3) 🟢 [ACTIVE ON GITHUB]   Routing_Switching_GruppArbete
-   4) ⚪                      Övning-Bringup-interoperabilitet
-   5) ⚪                      Nätsäkerhet_advc_labb_1
-```
-
-### Switch to a Different Project
-```bash
-# Interactive selection:
-gns3-switch
-
-# Direct switch by name or index:
-gns3-switch bringup
-# or
-gns3sync switch 4
-```
-
-GNS3Sync automatically:
-1. Updates your configuration.
-2. Clears stale configuration files from previous labs so old nodes never linger.
-3. Extracts all nodes, interfaces, and configs for the selected project.
-4. Commits and pushes the clean update to GitHub!
+GNS3Sync cleans out previous configs and ensures your GitHub repository is updated with the exact project you selected.
 
 ---
 
@@ -216,5 +210,5 @@ python3 tests/test_parser.py
 
 ## 📄 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).  
 Created by **Hugo Mossberg** (2026).
