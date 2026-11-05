@@ -1,0 +1,50 @@
+# =====================================================================
+# GNS3Sync Configuration Template
+# Automated GitOps & Disaster Recovery documentation for GNS3 topologies
+# =====================================================================
+
+# 1. Projects Directory
+# Path where your GNS3 projects reside on disk.
+# Common paths on Linux:
+#   - ~/GNS3/projects       (Standard Linux GNS3 GUI default)
+#   - /opt/gns3/projects    (Standard GNS3 VM / server default)
+#   - /mnt/gns3/projects    (Custom external storage mount)
+projects_dir: "~/GNS3/projects"
+
+# 2. Primary Export Directory
+# Local directory where your primary Git repository will be exported and maintained.
+export_dir: "~/gns3-export/primary"
+
+# 3. Remote GitHub / Git Repository (Primary Lab)
+# The SSH or HTTPS remote URL of your GitHub repository.
+# Examples:
+#   - git@github.com:username/my-gns3-labs.git
+#   - https://github.com/username/my-gns3-labs.git
+repo_url: "git@github.com:username/my-gns3-labs.git"
+repo_name: "my-gns3-labs"
+
+# 4. Project Selection Keywords
+# Keyword(s) used to match which GNS3 project is treated as the primary active lab.
+# Matching is case-insensitive. You can switch active project anytime using:
+#   gns3sync switch
+project_keywords:
+  - "main"
+  - "routing_switching"
+  - "grupparbete"
+
+# 5. Dual-Sync / Personal Lab Archive (Optional)
+# If enabled, all secondary labs on the server are automatically exported
+# into an archive directory and documented.
+# Leave empty or comment out to only export the active project.
+personal_export_dir: "~/gns3-export/archive"
+# Optional remote Git URL for the personal archive:
+# personal_repo_url: "git@github.com:username/my-personal-labs.git"
+
+# 6. Disk Inspection & QEMU NBD Settings
+# Used for out-of-band extraction of configurations from VM disk images (qcow2).
+mount_point: "/mnt/gns3_inspect"
+nbd_dev: "/dev/nbd0"
+
+# 7. Git Automation
+# Automatically commit and push changes to the remote Git repository upon sync.
+auto_push: true

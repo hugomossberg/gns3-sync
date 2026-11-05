@@ -1,0 +1,2521 @@
+#!/usr/bin/env python3
+"""
+GNS3Sync — Automated GitOps & Disaster Recovery documentation for GNS3 topologies.
+Extracts multi-vendor configurations out-of-band and renders clean GitHub documentation.
+"""
+import os
+import sys
+import json
+import base64
+import re
+import shutil
+import glob
+import time
+import subprocess
+import argparse
+from datetime import datetime
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+
+def get_web_url_from_git_remote(remote_url):
+    """Converts SSH or HTTPS git remote URL to browser-accessible web URL."""
+    if not remote_url:
+        return ""
+    url = remote_url.strip()
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url[len("git@github.com:"):]
+    elif url.startswith("git@gitlab.com:"):
+        url = "https://gitlab.com/" + url[len("git@gitlab.com:"):]
+    elif url.startswith("https://") or url.startswith("http://"):
+        pass
+    elif ":" in url and "@" in url:
+        parts = url.split(":", 1)
+        host = parts[0].split("@", 1)[-1]
+        url = f"https://{host}/{parts[1]}"
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url.rstrip("/")
+
+def auto_detect_projects_dir():
+    candidates = [
+        os.path.expanduser("~/GNS3/projects"),
+        "/opt/gns3/projects",
+        "/var/lib/gns3/projects",
+        "/mnt/gns3-fast/projects",
+        os.path.expanduser("~/gns3/projects"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return os.path.expanduser("~/GNS3/projects")
+
+DEFAULT_CONFIG = {
+    "projects_dir": auto_detect_projects_dir(),
+    "export_dir": os.path.expanduser("~/gns3-export/primary"),
+    "personal_export_dir": os.path.expanduser("~/gns3-export/personal"),
+    "repo_url": "",
+    "personal_repo_url": "",
+    "repo_name": "gns3-topology",
+    "project_keywords": ["routing_switching", "grupparbete", "gns3sync", "primary", "main"],
+    "mount_point": "/mnt/gns3_inspect",
+    "nbd_dev": "/dev/nbd0",
+    "auto_push": True
+}
+
+def load_config(custom_path=None):
+    candidates = [
+        custom_path,
+        os.environ.get("GNS3SYNC_CONFIG"),
+        "./config.yaml",
+        "./gns3sync.yaml",
+        os.path.expanduser("~/.config/gns3sync/config.yaml"),
+        "/etc/gns3sync/config.yaml"
+    ]
+    cfg = dict(DEFAULT_CONFIG)
+    for c in candidates:
+        if c and os.path.isfile(c):
+            if yaml:
+                try:
+                    with open(c, "r", encoding="utf-8") as f:
+                        user_cfg = yaml.safe_load(f) or {}
+                    cfg.update(user_cfg)
+                    cfg["_loaded_from"] = c
+                    break
+                except Exception:
+                    pass
+            else:
+                # Basic line parser if pyyaml missing
+                try:
+                    with open(c, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if ":" in line and not line.strip().startswith("#"):
+                                k, v = line.split(":", 1)
+                                k = k.strip()
+                                v = v.strip().strip('"').strip("'")
+                                if v.lower() == "true": v = True
+                                elif v.lower() == "false": v = False
+                                cfg[k] = v
+                    cfg["_loaded_from"] = c
+                    break
+                except Exception:
+                    pass
+    
+    # Auto-detect projects_dir if default does not exist on disk
+    if not os.path.isdir(cfg["projects_dir"]):
+        for alt in ["/opt/gns3/projects", "/var/lib/gns3/projects", os.path.expanduser("~/GNS3/projects")]:
+            if os.path.isdir(alt):
+                cfg["projects_dir"] = alt
+                break
+    return cfg
+
+# Active configuration instance
+CONFIG = load_config()
+
+BASE_EXPORT_DIR = os.path.dirname(CONFIG["export_dir"])
+GROUP_EXPORT_DIR = CONFIG["export_dir"]
+PERSONAL_EXPORT_DIR = CONFIG.get("personal_export_dir", os.path.join(BASE_EXPORT_DIR, "personal"))
+PROJECTS_DIR = CONFIG["projects_dir"]
+MOUNT_POINT = CONFIG["mount_point"]
+NBD_DEV = CONFIG["nbd_dev"]
+GROUP_PROJECT_KEYWORDS = CONFIG.get("project_keywords", ["routing_switching", "grupparbete", "gns3sync"])
+def sanitize_name(name):
+    clean = re.sub(r'[^a-zA-Z0-9åäöÅÄÖ\-_]+', '_', str(name))
+    return clean.strip('_')
+
+def escape_mermaid(text):
+    return str(text).replace('"', "'").replace("<", "&lt;").replace(">", "&gt;")
+
+def is_group_project(pname):
+    return any(k in pname.lower() for k in GROUP_PROJECT_KEYWORDS)
+
+def safe_read_file(filepath):
+    try:
+        with open(filepath, "r", errors="ignore") as f:
+            return f.read().replace('\x00', '').strip()
+    except Exception:
+        try:
+            res = subprocess.run(["sudo", "/usr/bin/cat", filepath], capture_output=True, text=True, errors="ignore")
+            return res.stdout.replace('\x00', '').strip()
+        except Exception:
+            return ""
+
+def extract_cisco_config(qcow2_path):
+    if not os.path.isfile(qcow2_path) or os.path.getsize(qcow2_path) > 250 * 1024 * 1024:
+        return None
+    try:
+        res = subprocess.run(["strings", "-a", "-n", "4", qcow2_path], capture_output=True, text=True, errors="replace", timeout=5)
+        lines = res.stdout.splitlines()
+        start = None
+        for i, l in enumerate(lines):
+            l_str = l.strip()
+            if any(l_str.startswith(k) for k in ["version 15.", "version 12.", "version 16.", "version 17.", "hostname ", "Current configuration", "! Command: show running-config", "! vEOS version", "transceiver qsfp"]):
+                start = i
+                for k in range(max(0, i-5), i):
+                    if lines[k].startswith("!"):
+                        start = k
+                        break
+                break
+        if start is None:
+            return None
+        cfg = []
+        in_vty = False
+        for l in lines[start:]:
+            if re.match(r"^[0-9A-Fa-f]{2,8}\s+[0-9A-Fa-f]{8}", l) or (len(l.strip()) > 3 and all(c in "0123456789ABCDEFabcdef " for c in l.strip())):
+                break
+            if l.strip() == "end":
+                cfg.append("end")
+                break
+            cfg.append(l)
+            if l.startswith("line vty"):
+                in_vty = True
+            elif in_vty:
+                if l.startswith("!") or l.strip() == "end" or len(l) > 60:
+                    break
+        if len(cfg) > 10:
+            if not any(x.strip() == "end" for x in cfg[-3:]):
+                cfg.append("!")
+                cfg.append("end")
+            raw = "\n".join(cfg)
+            cleaned = re.sub(r'banner (?:exec|incoming|login|motd)[^\n]*\n(?:\*[^\n]*\n)+', '', raw)
+            cleaned = cleaned.replace('\x00', '')
+            cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+            return cleaned
+    except Exception:
+        pass
+    return None
+
+def strip_config_header(text):
+    """Strips auto-generated comment headers for accurate semantic diffing."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if lines and ("===" in lines[0] or (len(lines) > 1 and "===" in lines[1])):
+        idx = 0
+        for i, l in enumerate(lines[:12]):
+            if "===" in l and i > 0:
+                idx = i + 1
+                break
+        return "\n".join(lines[idx:]).strip()
+    return text.strip()
+
+def get_previous_config(repo_dir, rel_path, current_content):
+    """
+    Finds the immediately preceding distinct version of rel_path in git history.
+    Returns dict with commit hash, date, commit message, and raw content, or None.
+    """
+    if not repo_dir or not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return None
+    res = subprocess.run(
+        ["git", "-C", repo_dir, "log", "--format=%H|%cd|%s", "--date=iso", "--", rel_path],
+        capture_output=True,
+        text=True
+    )
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+
+    clean_cur = strip_config_header(current_content)
+    for line in res.stdout.strip().splitlines():
+        parts = line.split("|", 2)
+        if len(parts) >= 3:
+            h, d, msg = parts[0], parts[1], parts[2]
+            show_res = subprocess.run(
+                ["git", "-C", repo_dir, "show", f"{h}:{rel_path}"],
+                capture_output=True,
+                text=True
+            )
+            if show_res.returncode == 0:
+                past_raw = show_res.stdout
+                clean_past = strip_config_header(past_raw)
+                if clean_past and clean_past != clean_cur:
+                    return {
+                        "commit": h[:7],
+                        "date": d[:19],
+                        "msg": msg,
+                        "raw": past_raw
+                    }
+    return None
+
+def build_pasteable_snippet(platform_type, node_name, project_name, content, is_rollback=False, commit_hash=None, commit_date=None, target_path=None):
+    clean_content = strip_config_header(content)
+    
+    if is_rollback:
+        header_text = (
+            f"Rollback Configuration for {node_name} (1 Step Back)\n"
+            f"Restores state from Git commit: {commit_hash} ({commit_date})\n"
+            f"Paste directly into terminal/console to restore previous configuration."
+        )
+    else:
+        header_text = (
+            f"Active Disaster Recovery for {node_name} ({project_name})\n"
+            f"Paste directly into terminal/console to reapply active configuration."
+        )
+
+    if platform_type in ["cisco", "arista"]:
+        cfg_clean = clean_content.strip()
+        if not cfg_clean.endswith("end"):
+            cfg_clean += "\nend"
+        cmt = "!"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"enable\n"
+            f"configure terminal\n"
+            f"{cfg_clean}\n"
+            f"write memory\n"
+        )
+        return "cisco", snippet
+
+    elif platform_type in ["linux_interfaces", "interfaces"]:
+        path = target_path or "/etc/network/interfaces"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart networking 2>/dev/null || sudo ifreload -a 2>/dev/null || sudo /etc/init.d/networking restart\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "netplan":
+        path = target_path or "/etc/netplan/01-netcfg.yaml"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo netplan apply\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "frr":
+        path = target_path or "/etc/frr/frr.conf"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart frr 2>/dev/null || sudo vtysh -f {path}\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "frr_daemons":
+        path = target_path or "/etc/frr/daemons"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart frr\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "nginx":
+        path = target_path or "/etc/nginx/sites-available/default"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo nginx -t && sudo systemctl reload nginx\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "unbound":
+        path = target_path or "/etc/unbound/unbound.conf.d/lab.conf"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo unbound-checkconf 2>/dev/null; sudo systemctl restart unbound\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "bind":
+        path = target_path or "/etc/bind/named.conf.local"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo named-checkconf 2>/dev/null; sudo systemctl restart bind9\n"
+        )
+        return "bash", snippet
+
+    elif platform_type in ["snmptrapd", "snmpd"]:
+        path = target_path or ("/etc/snmp/snmptrapd.conf" if platform_type == "snmptrapd" else "/etc/snmp/snmpd.conf")
+        svc = "snmptrapd" if platform_type == "snmptrapd" else "snmpd"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart {svc}\n"
+        )
+        return "bash", snippet
+
+    elif platform_type in ["nftables", "iptables", "ufw"]:
+        path = target_path or ("/etc/nftables.conf" if platform_type == "nftables" else "/etc/iptables/rules.v4")
+        apply_cmd = f"sudo nft -f {path}" if platform_type == "nftables" else ("sudo ufw reload" if platform_type == "ufw" else f"sudo iptables-restore < {path}")
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"{apply_cmd}\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "wireguard":
+        path = target_path or "/etc/wireguard/wg0.conf"
+        base_if = os.path.splitext(os.path.basename(path))[0]
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart wg-quick@{base_if}\n"
+        )
+        return "bash", snippet
+
+    elif platform_type in ["keepalived", "haproxy"]:
+        path = target_path or ("/etc/keepalived/keepalived.conf" if platform_type == "keepalived" else "/etc/haproxy/haproxy.conf")
+        svc = "keepalived" if platform_type == "keepalived" else "haproxy"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo systemctl restart {svc}\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "sysctl":
+        path = target_path or "/etc/sysctl.d/99-ipforward.conf"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"sudo sysctl --system\n"
+        )
+        return "bash", snippet
+
+    elif platform_type == "junos":
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} Paste into Junos CLI (enter 'cli', then 'configure'):\n"
+            f"{cmt} =====================================================================\n"
+            f"load override terminal\n"
+            f"{clean_content.strip()}\n"
+            f"# (Press Ctrl+D, then execute:)\n"
+            f"# commit and-quit\n"
+        )
+        return "text", snippet
+
+    elif platform_type == "freebsd":
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{cmt} {header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee /etc/rc.conf > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"service netif restart\n"
+        )
+        return "sh", snippet
+
+    elif platform_type == "vyos":
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{cmt} {header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"{clean_content.strip()}\n"
+        )
+        return "text", snippet
+
+    elif platform_type == "vpcs":
+        return "text", clean_content.strip()
+    elif platform_type == "docker":
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{cmt} {header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"cat << 'EOF' > /etc/network/interfaces\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+            f"/etc/init.d/networking restart\n"
+        )
+        return "bash", snippet
+    else:
+        path = target_path or "/etc/config.txt"
+        cmt = "#"
+        header_lines = "\n".join([f"{cmt} {line}" if line else cmt for line in header_text.splitlines()])
+        snippet = (
+            f"{cmt} =====================================================================\n"
+            f"{header_lines}\n"
+            f"{cmt} =====================================================================\n"
+            f"sudo tee {path} > /dev/null << 'EOF'\n"
+            f"{clean_content.strip()}\n"
+            f"EOF\n"
+        )
+        return "bash", snippet
+
+def inspect_generic_qemu_disk(qcow2_path, node_name, project_name):
+    if not os.path.isfile(qcow2_path):
+        return []
+    try:
+        if subprocess.run(["fuser", qcow2_path], capture_output=True).returncode == 0:
+            return []
+    except Exception:
+        pass
+    os.makedirs(MOUNT_POINT, exist_ok=True)
+    extracted_list = []
+    try:
+        subprocess.run(["sudo", "qemu-nbd", "-d", NBD_DEV], capture_output=True)
+        cmd_connect = [
+            "sudo", "qemu-nbd", "-r", "-c", NBD_DEV,
+            "--image-opts",
+            f"driver=qcow2,file.filename={qcow2_path},file.locking=off,backing.file.locking=off"
+        ]
+        res = subprocess.run(cmd_connect, capture_output=True, text=True, timeout=5)
+        if res.returncode != 0:
+            return []
+            
+        time.sleep(0.4)
+        subprocess.run(["sudo", "partx", "-u", NBD_DEV], capture_output=True)
+        parts = sorted(glob.glob(f"{NBD_DEV}p*"), key=lambda p: os.path.basename(p))
+        candidates = parts if parts else [NBD_DEV]
+        
+        for p in candidates:
+            mounted = False
+            for m_opt in [["-o", "ro,noload", "-t", "ext4"], ["-o", "ro"], ["-o", "ro"]]:
+                m_res = subprocess.run(["sudo", "mount"] + m_opt + [p, MOUNT_POINT], capture_output=True)
+                if m_res.returncode == 0:
+                    mounted = True
+                    break
+            if not mounted:
+                continue
+                
+            try:
+                # 1. FRR Routing (OSPF, BGP, RIP, interfaces)
+                frr_conf = os.path.join(MOUNT_POINT, "etc", "frr", "frr.conf")
+                if os.path.isfile(frr_conf) or subprocess.run(["sudo", "test", "-f", frr_conf]).returncode == 0:
+                    c_frr = safe_read_file(frr_conf)
+                    if c_frr and any(k in c_frr for k in ["router ", "interface ", "frr ", "vtysh"]):
+                        r_lang, r_snip = build_pasteable_snippet("frr", node_name, project_name, c_frr, target_path="/etc/frr/frr.conf")
+                        extracted_list.append({
+                            "type": "frr",
+                            "filename": f"{node_name}_frr.conf",
+                            "raw": c_frr,
+                            "desc": "FRR Routing Config (OSPF/BGP/vtysh)",
+                            "service_title": "FRR Routing (OSPF/BGP)",
+                            "target_path": "/etc/frr/frr.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 1b. FRR Daemons
+                frr_daemons = os.path.join(MOUNT_POINT, "etc", "frr", "daemons")
+                if os.path.isfile(frr_daemons) or subprocess.run(["sudo", "test", "-f", frr_daemons]).returncode == 0:
+                    c_daemons = safe_read_file(frr_daemons)
+                    if c_daemons and any(k in c_daemons for k in ["ospfd=yes", "bgpd=yes", "ripd=yes", "ospf6d=yes"]):
+                        r_lang, r_snip = build_pasteable_snippet("frr_daemons", node_name, project_name, c_daemons, target_path="/etc/frr/daemons")
+                        extracted_list.append({
+                            "type": "frr_daemons",
+                            "filename": f"{node_name}_frr_daemons",
+                            "raw": c_daemons,
+                            "desc": "FRR Active Daemons",
+                            "service_title": "FRR Active Daemons",
+                            "target_path": "/etc/frr/daemons",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 2. Linux Interfaces (/etc/network/interfaces)
+                net_if = os.path.join(MOUNT_POINT, "etc", "network", "interfaces")
+                if os.path.isfile(net_if) or subprocess.run(["sudo", "test", "-f", net_if]).returncode == 0:
+                    content = safe_read_file(net_if)
+                    if content and any(k in content for k in ["iface", "auto", "source", "mapping"]):
+                        r_lang, r_snip = build_pasteable_snippet("linux_interfaces", node_name, project_name, content, target_path="/etc/network/interfaces")
+                        extracted_list.append({
+                            "type": "linux_interfaces",
+                            "filename": f"{node_name}_interfaces",
+                            "raw": content,
+                            "desc": "Linux Network Interfaces",
+                            "service_title": "Network Interfaces",
+                            "target_path": "/etc/network/interfaces",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 3. Ubuntu Netplan YAML (only genuine configs, skip cloud-init boilerplate)
+                netplans = glob.glob(os.path.join(MOUNT_POINT, "etc", "netplan", "*.yaml"))
+                for np in netplans:
+                    base = os.path.basename(np)
+                    if "cloud-init" in base or "installer" in base:
+                        continue
+                    content = safe_read_file(np)
+                    if content and "network:" in content and "cloud-init" not in content and "datasource" not in content:
+                        t_path = f"/etc/netplan/{base}"
+                        r_lang, r_snip = build_pasteable_snippet("netplan", node_name, project_name, content, target_path=t_path)
+                        extracted_list.append({
+                            "type": "netplan",
+                            "filename": f"{node_name}_netplan_{base}",
+                            "raw": content,
+                            "desc": f"Netplan ({base})",
+                            "service_title": f"Netplan ({base})",
+                            "target_path": t_path,
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+                # 4. Nginx Reverse Proxy / Sites
+                nginx_sites = glob.glob(os.path.join(MOUNT_POINT, "etc", "nginx", "sites-available", "*"))
+                for ns in nginx_sites:
+                    base = os.path.basename(ns)
+                    content = safe_read_file(ns)
+                    if content and len(content) > 30:
+                        if base == "default" and "nginx default" in content.lower() and "proxy_pass" not in content:
+                            continue
+                        t_path = f"/etc/nginx/sites-available/{base}"
+                        r_lang, r_snip = build_pasteable_snippet("nginx", node_name, project_name, content, target_path=t_path)
+                        extracted_list.append({
+                            "type": "nginx",
+                            "filename": f"{node_name}_nginx_{base}.conf",
+                            "raw": content,
+                            "desc": f"Nginx Site ({base})",
+                            "service_title": f"Nginx Site ({base})",
+                            "target_path": t_path,
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 5. Unbound DNS Resolver
+                unbound_confs = glob.glob(os.path.join(MOUNT_POINT, "etc", "unbound", "unbound.conf.d", "*.conf"))
+                for uc in unbound_confs:
+                    base = os.path.basename(uc)
+                    if "remote-control" in base or "trust-anchor" in base:
+                        continue
+                    content = safe_read_file(uc)
+                    if content and len(content) > 20:
+                        t_path = f"/etc/unbound/unbound.conf.d/{base}"
+                        r_lang, r_snip = build_pasteable_snippet("unbound", node_name, project_name, content, target_path=t_path)
+                        extracted_list.append({
+                            "type": "unbound",
+                            "filename": f"{node_name}_unbound_{base}",
+                            "raw": content,
+                            "desc": f"Unbound DNS ({base})",
+                            "service_title": f"Unbound DNS ({base})",
+                            "target_path": t_path,
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 6. BIND9 DNS
+                named_local = os.path.join(MOUNT_POINT, "etc", "bind", "named.conf.local")
+                if os.path.isfile(named_local) or subprocess.run(["sudo", "test", "-f", named_local]).returncode == 0:
+                    c_named = safe_read_file(named_local)
+                    if c_named and "zone " in c_named:
+                        r_lang, r_snip = build_pasteable_snippet("bind", node_name, project_name, c_named, target_path="/etc/bind/named.conf.local")
+                        extracted_list.append({
+                            "type": "bind",
+                            "filename": f"{node_name}_named.conf.local",
+                            "raw": c_named,
+                            "desc": "BIND9 Local Zones",
+                            "service_title": "BIND9 Local Zones",
+                            "target_path": "/etc/bind/named.conf.local",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 7. SNMP Traps & SNMP Agent
+                snmp_trap = os.path.join(MOUNT_POINT, "etc", "snmp", "snmptrapd.conf")
+                if os.path.isfile(snmp_trap) or subprocess.run(["sudo", "test", "-f", snmp_trap]).returncode == 0:
+                    c_trap = safe_read_file(snmp_trap)
+                    if c_trap and len(c_trap) > 20:
+                        r_lang, r_snip = build_pasteable_snippet("snmptrapd", node_name, project_name, c_trap, target_path="/etc/snmp/snmptrapd.conf")
+                        extracted_list.append({
+                            "type": "snmptrapd",
+                            "filename": f"{node_name}_snmptrapd.conf",
+                            "raw": c_trap,
+                            "desc": "SNMP Trap Daemon Configuration",
+                            "service_title": "SNMP Trap Daemon",
+                            "target_path": "/etc/snmp/snmptrapd.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                snmp_agent = os.path.join(MOUNT_POINT, "etc", "snmp", "snmpd.conf")
+                if os.path.isfile(snmp_agent) or subprocess.run(["sudo", "test", "-f", snmp_agent]).returncode == 0:
+                    c_agent = safe_read_file(snmp_agent)
+                    if c_agent and any(k in c_agent for k in ["rocommunity", "rwcommunity", "rouser", "rwuser", "trap2sink"]):
+                        r_lang, r_snip = build_pasteable_snippet("snmpd", node_name, project_name, c_agent, target_path="/etc/snmp/snmpd.conf")
+                        extracted_list.append({
+                            "type": "snmpd",
+                            "filename": f"{node_name}_snmpd.conf",
+                            "raw": c_agent,
+                            "desc": "SNMP Agent Daemon Configuration",
+                            "service_title": "SNMP Agent Daemon",
+                            "target_path": "/etc/snmp/snmpd.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 8. nftables / iptables / UFW Firewalls
+                nft_conf = os.path.join(MOUNT_POINT, "etc", "nftables.conf")
+                if os.path.isfile(nft_conf) or subprocess.run(["sudo", "test", "-f", nft_conf]).returncode == 0:
+                    c_nft = safe_read_file(nft_conf)
+                    if c_nft and any(k in c_nft for k in ["table ", "chain ", "nftables"]):
+                        r_lang, r_snip = build_pasteable_snippet("nftables", node_name, project_name, c_nft, target_path="/etc/nftables.conf")
+                        extracted_list.append({
+                            "type": "nftables",
+                            "filename": f"{node_name}_nftables.conf",
+                            "raw": c_nft,
+                            "desc": "nftables Firewall Rules",
+                            "service_title": "nftables Firewall Rules",
+                            "target_path": "/etc/nftables.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                ipt_v4 = os.path.join(MOUNT_POINT, "etc", "iptables", "rules.v4")
+                if os.path.isfile(ipt_v4) or subprocess.run(["sudo", "test", "-f", ipt_v4]).returncode == 0:
+                    c_ipt = safe_read_file(ipt_v4)
+                    if c_ipt and "*filter" in c_ipt:
+                        r_lang, r_snip = build_pasteable_snippet("iptables", node_name, project_name, c_ipt, target_path="/etc/iptables/rules.v4")
+                        extracted_list.append({
+                            "type": "iptables",
+                            "filename": f"{node_name}_iptables.v4",
+                            "raw": c_ipt,
+                            "desc": "iptables IPv4 Rules",
+                            "service_title": "iptables IPv4 Rules",
+                            "target_path": "/etc/iptables/rules.v4",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 9. WireGuard VPN
+                wg_confs = glob.glob(os.path.join(MOUNT_POINT, "etc", "wireguard", "*.conf"))
+                for wc in wg_confs:
+                    base = os.path.basename(wc)
+                    content = safe_read_file(wc)
+                    if content and "[Interface]" in content:
+                        t_path = f"/etc/wireguard/{base}"
+                        r_lang, r_snip = build_pasteable_snippet("wireguard", node_name, project_name, content, target_path=t_path)
+                        extracted_list.append({
+                            "type": "wireguard",
+                            "filename": f"{node_name}_wireguard_{base}",
+                            "raw": content,
+                            "desc": f"WireGuard VPN ({base})",
+                            "service_title": f"WireGuard VPN ({base})",
+                            "target_path": t_path,
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 10. Keepalived VRRP
+                keepalived_conf = os.path.join(MOUNT_POINT, "etc", "keepalived", "keepalived.conf")
+                if os.path.isfile(keepalived_conf) or subprocess.run(["sudo", "test", "-f", keepalived_conf]).returncode == 0:
+                    c_keep = safe_read_file(keepalived_conf)
+                    if c_keep and "vrrp_instance" in c_keep:
+                        r_lang, r_snip = build_pasteable_snippet("keepalived", node_name, project_name, c_keep, target_path="/etc/keepalived/keepalived.conf")
+                        extracted_list.append({
+                            "type": "keepalived",
+                            "filename": f"{node_name}_keepalived.conf",
+                            "raw": c_keep,
+                            "desc": "Keepalived VRRP Configuration",
+                            "service_title": "Keepalived VRRP",
+                            "target_path": "/etc/keepalived/keepalived.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 11. Sysctl IP Forwarding
+                sysctl_ipf = os.path.join(MOUNT_POINT, "etc", "sysctl.d", "99-ipforward.conf")
+                if os.path.isfile(sysctl_ipf) or subprocess.run(["sudo", "test", "-f", sysctl_ipf]).returncode == 0:
+                    c_sysctl = safe_read_file(sysctl_ipf)
+                    if c_sysctl and "ip_forward" in c_sysctl:
+                        r_lang, r_snip = build_pasteable_snippet("sysctl", node_name, project_name, c_sysctl, target_path="/etc/sysctl.d/99-ipforward.conf")
+                        extracted_list.append({
+                            "type": "sysctl",
+                            "filename": f"{node_name}_ipforward.conf",
+                            "raw": c_sysctl,
+                            "desc": "Linux Kernel IP Forwarding",
+                            "service_title": "Kernel IP Forwarding",
+                            "target_path": "/etc/sysctl.d/99-ipforward.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 12. Juniper Junos
+                import gzip
+                for j_rel in ["config/juniper.conf.gz", "config/juniper.conf", "var/etc/juniper.conf"]:
+                    j_path = os.path.join(MOUNT_POINT, j_rel)
+                    if os.path.isfile(j_path) or subprocess.run(["sudo", "test", "-f", j_path]).returncode == 0:
+                        c_junos = ""
+                        try:
+                            if j_rel.endswith(".gz"):
+                                cat_p = subprocess.run(["sudo", "/usr/bin/cat", j_path], capture_output=True)
+                                c_junos = gzip.decompress(cat_p.stdout).decode("utf-8", errors="ignore").strip()
+                            else:
+                                c_junos = safe_read_file(j_path)
+                        except Exception:
+                            pass
+                        if c_junos and len(c_junos) > 10:
+                            r_lang, r_snip = build_pasteable_snippet("junos", node_name, project_name, c_junos)
+                            extracted_list.append({
+                                "type": "junos",
+                                "filename": f"{node_name}_juniper.conf",
+                                "raw": c_junos,
+                                "desc": "Juniper Junos Configuration",
+                                "service_title": "Juniper Configuration",
+                                "target_path": "/config/juniper.conf",
+                                "restore_lang": r_lang,
+                                "restore_snippet": r_snip
+                            })
+                            break
+
+                # 13. Arista vEOS
+                for arista_rel in ["mnt/flash/startup-config", "flash/startup-config", "startup-config"]:
+                    arista = os.path.join(MOUNT_POINT, arista_rel)
+                    if os.path.isfile(arista) or subprocess.run(["sudo", "test", "-f", arista]).returncode == 0:
+                        c_arista = safe_read_file(arista)
+                        if c_arista and len(c_arista) > 10:
+                            r_lang, r_snip = build_pasteable_snippet("arista", node_name, project_name, c_arista)
+                            extracted_list.append({
+                                "type": "arista",
+                                "filename": f"{node_name}_startup-config.cfg",
+                                "raw": c_arista,
+                                "desc": "Arista EOS Startup-Config",
+                                "service_title": "Arista Startup-Config",
+                                "target_path": "/mnt/flash/startup-config",
+                                "restore_lang": r_lang,
+                                "restore_snippet": r_snip
+                            })
+                            break
+
+                # 14. VyOS
+                vyos = os.path.join(MOUNT_POINT, "config", "config.boot")
+                if os.path.isfile(vyos):
+                    content = safe_read_file(vyos)
+                    if content and len(content) > 10:
+                        r_lang, r_snip = build_pasteable_snippet("vyos", node_name, project_name, content)
+                        extracted_list.append({
+                            "type": "vyos",
+                            "filename": f"{node_name}_config.boot",
+                            "raw": content,
+                            "desc": "VyOS Configuration Boot",
+                            "service_title": "VyOS Configuration",
+                            "target_path": "/config/config.boot",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+
+                # 15. pfSense & OPNsense Firewall Configuration (XML)
+                for pf_rel in ["conf/config.xml", "cf/conf/config.xml", "conf.default/config.xml"]:
+                    pf_path = os.path.join(MOUNT_POINT, pf_rel)
+                    if os.path.isfile(pf_path) or subprocess.run(["sudo", "test", "-f", pf_path]).returncode == 0:
+                        content = safe_read_file(pf_path)
+                        if content and ("<pfsense" in content or "<opnsense" in content or "<system>" in content):
+                            fw_type = "OPNsense" if "<opnsense" in content else "pfSense"
+                            r_snippet = (
+                                f"# =====================================================================\n"
+                                f"# Active Disaster Recovery for {node_name} ({project_name})\n"
+                                f"# Platform: {fw_type} Firewall XML Configuration\n"
+                                f"# Paste directly into {fw_type} shell to reapply config.xml\n"
+                                f"# =====================================================================\n"
+                                f"cat << 'EOF' > /conf/config.xml\n"
+                                f"{content}\n"
+                                f"EOF\n"
+                                f"# Reload firewall filter and active services\n"
+                                f"/etc/rc.reload_all 2>/dev/null || php -r \"require_once('/etc/inc/config.inc'); require_once('/etc/inc/filter.inc'); filter_configure();\"\n"
+                            )
+                            extracted_list.append({
+                                "type": "pfsense" if fw_type == "pfSense" else "opnsense",
+                                "filename": f"{node_name}_{fw_type.lower()}_config.xml",
+                                "raw": content,
+                                "desc": f"{fw_type} Firewall Configuration (XML)",
+                                "service_title": f"{fw_type} Firewall Config (XML)",
+                                "target_path": "/conf/config.xml",
+                                "restore_lang": "bash",
+                                "restore_snippet": r_snippet
+                            })
+                            break
+
+                # 16. FreeBSD System rc.conf
+                rc_conf = os.path.join(MOUNT_POINT, "etc", "rc.conf")
+                if os.path.isfile(rc_conf):
+                    content = safe_read_file(rc_conf)
+                    if content and len(content) > 10:
+                        r_lang, r_snip = build_pasteable_snippet("freebsd", node_name, project_name, content)
+                        extracted_list.append({
+                            "type": "freebsd",
+                            "filename": f"{node_name}_rc.conf",
+                            "raw": content,
+                            "desc": "FreeBSD rc.conf",
+                            "service_title": "FreeBSD System Config",
+                            "target_path": "/etc/rc.conf",
+                            "restore_lang": r_lang,
+                            "restore_snippet": r_snip
+                        })
+            finally:
+                subprocess.run(["sudo", "umount", MOUNT_POINT], capture_output=True)
+                
+            if extracted_list:
+                break
+        return extracted_list
+    except Exception:
+        return []
+    finally:
+        subprocess.run(["sudo", "umount", "-f", MOUNT_POINT], capture_output=True)
+        subprocess.run(["sudo", "qemu-nbd", "-d", NBD_DEV], capture_output=True)
+
+def get_dhcp_leases():
+    leases = {}
+    vstatus = "/var/lib/libvirt/dnsmasq/virbr0.status"
+    if os.path.isfile(vstatus):
+        try:
+            with open(vstatus, "r", errors="ignore") as f:
+                data = json.load(f)
+                for item in data:
+                    mac = (item.get("mac-address") or "").lower()
+                    ip = item.get("ip-address")
+                    if mac and ip:
+                        leases[mac] = ip
+        except Exception:
+            pass
+    try:
+        with open("/proc/net/arp", "r", errors="ignore") as f:
+            for line in f.readlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 4:
+                    ip = parts[0]
+                    mac = parts[3].lower()
+                    if mac != "00:00:00:00:00:00" and mac not in leases:
+                        leases[mac] = ip
+    except Exception:
+        pass
+    return leases
+
+def mask_to_cidr(mask_str):
+    if not mask_str:
+        return ""
+    mask_str = mask_str.strip()
+    if mask_str.startswith("/"):
+        return mask_str
+    if mask_str.isdigit():
+        return f"/{mask_str}"
+    parts = mask_str.split(".")
+    if len(parts) == 4:
+        try:
+            binary_str = "".join([bin(int(p))[2:].zfill(8) for p in parts])
+            return f"/{binary_str.count('1')}"
+        except Exception:
+            pass
+    return f"/{mask_str}"
+
+def parse_cisco_interfaces(cfg_text, node_name, dhcp_ip=None, hostname=None):
+    interfaces = []
+    current_if = None
+    display_node = f"{node_name} (`{hostname}`)" if hostname and hostname.lower() != node_name.lower() else node_name
+    for line in cfg_text.splitlines():
+        m_if = re.match(r"^interface\s+([A-Za-z0-9\/\.\-_]+)", line)
+        if m_if:
+            current_if = {
+                "node": display_node,
+                "name": m_if.group(1),
+                "ipv4": [],
+                "ipv6": [],
+                "desc": "-",
+                "shutdown": False
+            }
+            interfaces.append(current_if)
+            continue
+        if current_if:
+            l = line.strip()
+            if l.startswith("description "):
+                current_if["desc"] = l[12:].strip()
+            elif l.startswith("ip address "):
+                if not l.startswith("ip address dhcp"):
+                    parts = l[11:].strip().split()
+                    if len(parts) >= 2:
+                        ip_val = parts[0]
+                        mask_val = parts[1]
+                        cidr = mask_to_cidr(mask_val)
+                        sec_tag = " (Secondary)" if (len(parts) >= 3 and parts[2].lower() == "secondary") else ""
+                        current_if["ipv4"].append(f"{ip_val}{cidr}{sec_tag}")
+                    elif len(parts) == 1:
+                        current_if["ipv4"].append(parts[0])
+                else:
+                    if dhcp_ip:
+                        current_if["ipv4"].append(f"{dhcp_ip}/24 (DHCP)")
+                    else:
+                        current_if["ipv4"].append("DHCP (/24)")
+            elif l.startswith("ipv6 address "):
+                current_if["ipv6"].append(l[13:].strip())
+            elif l == "shutdown":
+                current_if["shutdown"] = True
+            elif line.startswith("!") or (line and not line.startswith(" ")):
+                current_if = None
+
+    active_interfaces = []
+    for iface in interfaces:
+        # Keep interface if it has an IP address assigned
+        if iface["ipv4"] or iface["ipv6"]:
+            active_interfaces.append(iface)
+        # Keep if it has a custom description
+        elif iface["desc"] != "-":
+            active_interfaces.append(iface)
+        # Keep if active (no shutdown)
+        elif not iface["shutdown"]:
+            active_interfaces.append(iface)
+
+    return active_interfaces if active_interfaces else interfaces
+
+def parse_linux_interfaces(content, node_name, dhcp_ip=None):
+    ifs = []
+    lines = content.splitlines()
+    cur_if = None
+    cur_addr = None
+    cur_netmask = None
+    cur_gw = None
+
+    def finalize_cur_if():
+        if not cur_if:
+            return
+        if cur_addr:
+            if "/" in cur_addr:
+                ip_fmt = cur_addr
+            elif cur_netmask:
+                ip_fmt = f"{cur_addr}{mask_to_cidr(cur_netmask)}"
+            else:
+                ip_fmt = cur_addr
+            if cur_gw:
+                ip_fmt += f" (GW: {cur_gw})"
+            cur_if["ipv4"].append(ip_fmt)
+        ifs.append(cur_if)
+
+    for line in lines:
+        m = re.match(r"^\s*iface\s+([A-Za-z0-9_\-\.\:]+)\s+inet[6]?\s+(static|dhcp|loopback)", line)
+        if m:
+            finalize_cur_if()
+            cur_if = None
+            cur_addr = None
+            cur_netmask = None
+            cur_gw = None
+
+            ifname = m.group(1)
+            mode = m.group(2)
+            if ifname == "lo":
+                continue
+            cur_ip = f"{dhcp_ip}/24 (DHCP)" if (mode == "dhcp" and dhcp_ip) else ("DHCP (/24)" if mode == "dhcp" else "")
+            cur_if = {
+                "node": node_name,
+                "name": ifname,
+                "ipv4": [cur_ip] if cur_ip else [],
+                "ipv6": [],
+                "desc": f"Linux ({mode})",
+                "shutdown": False
+            }
+            continue
+        if cur_if:
+            l = line.strip()
+            if l.startswith("address "):
+                cur_addr = l[8:].strip()
+            elif l.startswith("netmask "):
+                cur_netmask = l[8:].strip()
+            elif l.startswith("gateway "):
+                cur_gw = l[8:].strip()
+
+    finalize_cur_if()
+    return ifs
+
+def parse_netplan_interfaces(content, node_name, dhcp_ip=None):
+    ifs = []
+    cur_if = None
+    for line in content.splitlines():
+        m = re.match(r"^\s{4,8}([a-zA-Z0-9_\-]+):", line)
+        if m:
+            key = m.group(1)
+            if key not in ["ethernets", "version", "match", "addresses", "nameservers", "renderer"]:
+                cur_if = {
+                    "node": node_name,
+                    "name": key,
+                    "ipv4": [],
+                    "ipv6": [],
+                    "desc": "Linux (Netplan)",
+                    "shutdown": False
+                }
+                ifs.append(cur_if)
+                continue
+        if cur_if:
+            l = line.strip()
+            if "dhcp4: true" in l or "dhcp4: yes" in l:
+                cur_if["ipv4"].append(f"{dhcp_ip}/24 (DHCP)" if dhcp_ip else "DHCP (/24)")
+            elif l.startswith("- ") and re.search(r"\d+\.\d+\.\d+\.\d+", l):
+                ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+(?:/\d+)?)", l)
+                if ip_match:
+                    cur_if["ipv4"].append(ip_match.group(1))
+    return ifs
+
+def parse_junos_interfaces(content, node_name, dhcp_ip=None):
+    ifs = []
+    m_host = re.search(r"(?:host-name\s+([A-Za-z0-9_\-]+);|set system host-name\s+([A-Za-z0-9_\-]+))", content)
+    hostname = (m_host.group(1) or m_host.group(2)) if m_host else None
+    display_node = f"{node_name} (`{hostname}`)" if hostname and hostname.lower() != node_name.lower() else node_name
+
+    # Check for set-commands format
+    if "set interfaces " in content:
+        if_dict = {}
+        for line in content.splitlines():
+            l = line.strip()
+            m_set_ip = re.match(r"^set interfaces\s+([A-Za-z0-9_\-\.\/]+)\s+.*family inet[6]?\s+address\s+([0-9a-fA-F\.\:\/]+)", l)
+            if m_set_ip:
+                if_name = m_set_ip.group(1).split()[0]
+                ip = m_set_ip.group(2)
+                if_dict.setdefault(if_name, {"node": display_node, "name": if_name, "ipv4": [], "ipv6": [], "desc": "-", "shutdown": False})
+                if_dict[if_name]["ipv4"].append(ip)
+            m_set_desc = re.match(r'^set interfaces\s+([A-Za-z0-9_\-\.\/]+)\s+.*description\s+["\x27]?([^"\x27;]+)', l)
+            if m_set_desc:
+                if_name = m_set_desc.group(1).split()[0]
+                if_dict.setdefault(if_name, {"node": display_node, "name": if_name, "ipv4": [], "ipv6": [], "desc": "-", "shutdown": False})
+                if_dict[if_name]["desc"] = m_set_desc.group(2).strip()
+            m_set_dis = re.match(r"^set interfaces\s+([A-Za-z0-9_\-\.\/]+)\s+disable", l)
+            if m_set_dis:
+                if_name = m_set_dis.group(1).split()[0]
+                if_dict.setdefault(if_name, {"node": display_node, "name": if_name, "ipv4": [], "ipv6": [], "desc": "-", "shutdown": False})
+                if_dict[if_name]["shutdown"] = True
+        return list(if_dict.values())
+
+    # Hierarchical parser
+    m_ifs = re.search(r"interfaces\s*\{(.*?)\n\}", content, re.DOTALL)
+    if not m_ifs:
+        return ifs
+
+    if_block = m_ifs.group(1)
+    tokens = re.findall(r"([a-zA-Z0-9\/\.\-_]+)\s*\{([^\{\}]*?(?:\{[^\{\}]*?(?:\{[^\{\}]*?\}[^\{\}]*?)*?\}[^\{\}]*?)*?)\}", if_block)
+    for ifname, body in tokens:
+        if ifname in ["traceoptions"]:
+            continue
+        cur_if = {
+            "node": display_node,
+            "name": ifname,
+            "ipv4": [],
+            "ipv6": [],
+            "desc": "-",
+            "shutdown": "disable;" in body
+        }
+        m_desc = re.search(r'description\s+["\x27]?([^"\x27;]+)["\x27]?;', body)
+        if m_desc:
+            cur_if["desc"] = m_desc.group(1).strip()
+        ips = re.findall(r"address\s+([0-9\.\/]+);", body)
+        for ip in ips:
+            cur_if["ipv4"].append(ip)
+        if "dhcp;" in body or "dhcp-client;" in body:
+            cur_if["ipv4"].append(f"{dhcp_ip}/24 (DHCP)" if dhcp_ip else "DHCP (/24)")
+
+        if cur_if["ipv4"] or cur_if["desc"] != "-" or not cur_if["shutdown"]:
+            ifs.append(cur_if)
+
+    return ifs
+
+def parse_vpcs_ips(vpc_path, node_name):
+    ifs = []
+    try:
+        with open(vpc_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        for line in content.splitlines():
+            m = re.match(r"^\s*ip\s+([0-9\.]+)\s+([0-9\.]+)\s*(\d+)?", line)
+            if m:
+                ip = m.group(1)
+                gw = m.group(2)
+                cidr = m.group(3) or "24"
+                ifs.append({
+                    "node": node_name,
+                    "name": "eth0",
+                    "ipv4": [f"{ip}/{cidr} (GW: {gw})"],
+                    "ipv6": [],
+                    "desc": "VPCS Client",
+                    "shutdown": False
+                })
+    except Exception:
+        pass
+    return ifs
+
+def format_restore_header(node_name, project_name, device_type="Cisco"):
+    comment_char = "#" if device_type.lower() in ["linux", "vyos", "freebsd"] else "!"
+    return (
+        f"{comment_char} =====================================================================\n"
+        f"{comment_char} {device_type} Configuration for {node_name}\n"
+        f"{comment_char} Project: {project_name}\n"
+        f"{comment_char} Disaster Recovery / 1-Click Restore: See README.md on GitHub\n"
+        f"{comment_char} =====================================================================\n\n"
+    )
+
+def fix_export_ownership(export_dir=None):
+    target = export_dir or BASE_EXPORT_DIR
+    try:
+        user = os.environ.get("SUDO_USER")
+        if not user and hasattr(os, "getlogin"):
+            try:
+                user = os.getlogin()
+            except Exception:
+                pass
+        if not user:
+            uid = os.getuid()
+            if uid == 0:
+                for check_dir in [target, os.path.dirname(target)]:
+                    if os.path.exists(check_dir):
+                        stat_info = os.stat(check_dir)
+                        if stat_info.st_uid != 0:
+                            import pwd
+                            user = pwd.getpwuid(stat_info.st_uid).pw_name
+                            break
+        if user and user != "root":
+            subprocess.run(["sudo", "chown", "-R", f"{user}:{user}", target], capture_output=True)
+    except Exception:
+        pass
+
+def export_configs(proj_disk_path, target_dir, nodes, project_name):
+    configs_dir = os.path.join(target_dir, "configs")
+    if os.path.isdir(configs_dir):
+        for f in os.listdir(configs_dir):
+            fp = os.path.join(configs_dir, f)
+            try:
+                if os.path.isfile(fp) or os.path.islink(fp):
+                    os.unlink(fp)
+                elif os.path.isdir(fp):
+                    shutil.rmtree(fp)
+            except Exception:
+                pass
+    os.makedirs(configs_dir, exist_ok=True)
+    
+    saved_records = []
+    all_interfaces = []
+    pasteable_configs = []
+    dhcp_leases = get_dhcp_leases()
+    
+    for n in nodes:
+        nid = n.get("node_id")
+        nname = n.get("name")
+        s_nname = sanitize_name(nname)
+        props = n.get("properties") or {}
+        hda = props.get("hda_disk_image") or ""
+        ntype = n.get("node_type", "")
+        node_mac = (props.get("mac_address") or "").lower()
+        dhcp_ip = dhcp_leases.get(node_mac)
+        
+        handled = False
+        
+        # 1. Cisco IOS / ASAv CLI-based devices (Excludes Arista & vEOS from NVRAM search)
+        is_cisco = any(k in hda.lower() for k in ["cisco", "vios", "asav", "asa"]) and not any(k in hda.lower() for k in ["arista", "veos"])
+        if is_cisco:
+            qdisk = os.path.join(proj_disk_path, "project-files", "qemu", nid, "hda_disk.qcow2")
+            cfg = extract_cisco_config(qdisk)
+            device_family = "Cisco ASA Firewall" if any(k in hda.lower() for k in ["asav", "asa"]) else "Cisco IOS"
+            if cfg:
+                header = format_restore_header(nname, project_name, device_family)
+                full_cfg = header + cfg
+                fname = f"{s_nname}_running-config.cfg"
+                with open(os.path.join(configs_dir, fname), "w", encoding="utf-8") as f:
+                    f.write(full_cfg)
+                saved_records.append({"filename": fname, "node": nname, "type": f"{device_family} Running-Config"})
+                m_host = re.search(r"^hostname\s+([A-Za-z0-9_\-]+)", cfg, re.MULTILINE)
+                hostname = m_host.group(1) if m_host else None
+                ifs = parse_cisco_interfaces(cfg, nname, dhcp_ip=dhcp_ip, hostname=hostname)
+                all_interfaces.extend(ifs)
+                _, restore_snippet = build_pasteable_snippet("cisco", nname, project_name, cfg)
+                pasteable_configs.append({
+                    "node": nname,
+                    "type": "cisco",
+                    "config": restore_snippet,
+                    "platform": device_family,
+                    "platform_type": "cisco",
+                    "filename": fname,
+                    "raw_config": full_cfg
+                })
+                handled = True
+            else:
+                ip_msg = f"{dhcp_ip}/24 (DHCP Active)" if dhcp_ip else "Waiting for DHCP lease"
+                all_interfaces.append({
+                    "node": nname,
+                    "name": "(All ports)",
+                    "ipv4": [ip_msg],
+                    "ipv6": [],
+                    "desc": "Execute 'write memory' ('wr') in console to save interfaces to GitHub",
+                    "shutdown": True
+                })
+                restore_snippet = (
+                    f"! =====================================================================\n"
+                    f"! Disaster Recovery for {device_family}: {nname} ({project_name})\n"
+                    f"! Status: No saved startup configuration found in NVRAM yet.\n"
+                    f"! =====================================================================\n"
+                    f"! Tip: Execute the following command in console to save running config:\n"
+                    f"!   write memory   (or shorthand 'wr')\n"
+                    f"! Then run 'gns3-push' on the server terminal to sync instantly to GitHub!\n"
+                )
+                pasteable_configs.append({
+                    "node": nname,
+                    "type": "cisco",
+                    "config": restore_snippet,
+                    "platform": f"{device_family} (Pending 'write memory')",
+                    "platform_type": "cisco",
+                    "filename": None,
+                    "raw_config": ""
+                })
+                handled = True
+                
+        # 2. Universal QEMU Disk Inspector (Arista, FRR, Junos, Debian, Ubuntu, FreeBSD, VyOS, DNS, Nginx, SNMP, Firewalls)
+        if not handled and ntype == "qemu":
+            if n.get("status") == "started":
+                continue
+            qdisk_candidates = [
+                os.path.join(proj_disk_path, "project-files", "qemu", nid, "hda_disk.qcow2"),
+                os.path.join(proj_disk_path, "project-files", "qemu", nid, "hdb_disk.qcow2")
+            ]
+            disk_info_list = []
+            for qd in qdisk_candidates:
+                if os.path.isfile(qd):
+                    disk_info_list = inspect_generic_qemu_disk(qd, s_nname, project_name)
+                    if disk_info_list:
+                        break
+                        
+            if disk_info_list:
+                for disk_info in disk_info_list:
+                    fname = disk_info["filename"]
+                    with open(os.path.join(configs_dir, fname), "w", encoding="utf-8") as f:
+                        f.write(disk_info["raw"])
+                    saved_records.append({
+                        "filename": fname,
+                        "node": nname,
+                        "type": disk_info["desc"],
+                        "service_title": disk_info.get("service_title", disk_info["desc"]),
+                        "target_path": disk_info.get("target_path", "")
+                    })
+                    
+                    # Interface extraction (from network-defining configs)
+                    if disk_info["type"] == "linux_interfaces":
+                        l_ifs = parse_linux_interfaces(disk_info["raw"], nname, dhcp_ip=dhcp_ip)
+                        if not l_ifs and dhcp_ip:
+                            l_ifs.append({
+                                "node": nname,
+                                "name": "ens3 (eth0)",
+                                "ipv4": [f"{dhcp_ip}/24 (DHCP)"],
+                                "ipv6": [],
+                                "desc": "Linux Server",
+                                "shutdown": False
+                            })
+                        all_interfaces.extend(l_ifs)
+                    elif disk_info["type"] in ["frr", "arista"]:
+                        m_host = re.search(r"^hostname\s+([A-Za-z0-9_\-]+)", disk_info["raw"], re.MULTILINE)
+                        hostname = m_host.group(1) if m_host else None
+                        ifs = parse_cisco_interfaces(disk_info["raw"], nname, dhcp_ip=dhcp_ip, hostname=hostname)
+                        all_interfaces.extend(ifs)
+                    elif disk_info["type"] == "junos":
+                        j_ifs = parse_junos_interfaces(disk_info["raw"], nname, dhcp_ip=dhcp_ip)
+                        all_interfaces.extend(j_ifs)
+                    elif disk_info["type"] == "netplan":
+                        n_ifs = parse_netplan_interfaces(disk_info["raw"], nname, dhcp_ip=dhcp_ip)
+                        all_interfaces.extend(n_ifs)
+                        
+                    pasteable_configs.append({
+                        "node": nname,
+                        "type": disk_info["restore_lang"],
+                        "config": disk_info["restore_snippet"],
+                        "platform": disk_info["desc"],
+                        "platform_type": disk_info["type"],
+                        "filename": fname,
+                        "raw_config": disk_info["raw"],
+                        "service_title": disk_info.get("service_title", disk_info["desc"]),
+                        "target_path": disk_info.get("target_path", "")
+                    })
+                handled = True
+            elif any(k in hda.lower() for k in ["arista", "veos", "junos", "juniper", "frr"]):
+                if any(k in hda.lower() for k in ["arista", "veos"]):
+                    plat = "Arista vEOS"
+                    cmd_save = "'write memory' ('wr')"
+                    ptype = "arista"
+                elif any(k in hda.lower() for k in ["junos", "juniper"]):
+                    plat = "Juniper vJunos"
+                    cmd_save = "'commit'"
+                    ptype = "junos"
+                else:
+                    plat = "FRR 10.3"
+                    cmd_save = "'write memory' in vtysh"
+                    ptype = "frr"
+                    
+                all_interfaces.append({
+                    "node": nname,
+                    "name": "(All ports)",
+                    "ipv4": [f"{dhcp_ip}/24 (DHCP Active)"] if dhcp_ip else ["Pending configuration"],
+                    "ipv6": [],
+                    "desc": f"Execute {cmd_save} in console to save configuration to GitHub",
+                    "shutdown": True
+                })
+                pasteable_configs.append({
+                    "node": nname,
+                    "type": "text",
+                    "config": f"! {plat} for {nname}: Run {cmd_save} in the console to save configuration to GitHub!\n",
+                    "platform": f"{plat} (Pending {cmd_save})",
+                    "platform_type": ptype,
+                    "filename": None,
+                    "raw_config": "",
+                    "service_title": plat,
+                    "target_path": ""
+                })
+                handled = True
+
+        # 3. VPCS startup
+        vpc_file = os.path.join(proj_disk_path, "project-files", "vpcs", nid, "startup.vpc")
+        if os.path.isfile(vpc_file) and os.path.getsize(vpc_file) > 0:
+            fname = f"{s_nname}_startup.vpc"
+            shutil.copy2(vpc_file, os.path.join(configs_dir, fname))
+            saved_records.append({"filename": fname, "node": nname, "type": "VPCS IP/Startup Script"})
+            v_ifs = parse_vpcs_ips(vpc_file, nname)
+            all_interfaces.extend(v_ifs)
+            with open(vpc_file, "r", encoding="utf-8", errors="ignore") as f:
+                vcontent = f.read()
+            _, restore_snippet = build_pasteable_snippet("vpcs", nname, project_name, vcontent)
+            pasteable_configs.append({
+                "node": nname,
+                "type": "text",
+                "config": restore_snippet,
+                "platform": "Virtual PC (VPCS)",
+                "platform_type": "vpcs",
+                "filename": fname,
+                "raw_config": vcontent
+            })
+            handled = True
+            
+        # 4. Docker network interfaces
+        dock_file = os.path.join(proj_disk_path, "project-files", "docker", nid, "etc", "network", "interfaces")
+        if os.path.isfile(dock_file) and os.path.getsize(dock_file) > 0:
+            fname = f"{s_nname}_interfaces"
+            shutil.copy2(dock_file, os.path.join(configs_dir, fname))
+            saved_records.append({"filename": fname, "node": nname, "type": "Linux Network Interfaces"})
+            with open(dock_file, "r", encoding="utf-8", errors="ignore") as f:
+                dcontent = f.read()
+            d_ifs = parse_linux_interfaces(dcontent, nname)
+            all_interfaces.extend(d_ifs)
+            _, restore_snippet = build_pasteable_snippet("docker", nname, project_name, dcontent)
+            pasteable_configs.append({
+                "node": nname,
+                "type": "bash",
+                "config": restore_snippet,
+                "platform": "Docker Linux",
+                "platform_type": "docker",
+                "filename": fname,
+                "raw_config": dcontent
+            })
+            handled = True
+
+    # Generic remaining configs
+    pfiles_dir = os.path.join(proj_disk_path, "project-files")
+    if os.path.isdir(pfiles_dir):
+        for root, _, files in os.walk(pfiles_dir):
+            for file in files:
+                if file.endswith(('.cfg', '.conf')) and not file.endswith('.log') and not file.endswith('.log.txt'):
+                    src_f = os.path.join(root, file)
+                    rel = os.path.relpath(src_f, pfiles_dir)
+                    parts = rel.split(os.sep)
+                    prefix = ""
+                    if len(parts) >= 2:
+                        nid = parts[1]
+                        for n in nodes:
+                            if n.get("node_id") == nid:
+                                prefix = f"{sanitize_name(n.get('name'))}_"
+                                break
+                    dest_name = f"{prefix}{file}"
+                    dest_f = os.path.join(configs_dir, dest_name)
+                    if not os.path.exists(dest_f):
+                        shutil.copy2(src_f, dest_f)
+                        saved_records.append({"filename": dest_name, "node": prefix.strip('_') or "System", "type": "Configuration File"})
+                        
+    # Prune stale config files for removed nodes
+    active_filenames = {r["filename"] for r in saved_records}
+    if os.path.isdir(configs_dir):
+        for existing in os.listdir(configs_dir):
+            if existing not in active_filenames:
+                try:
+                    os.remove(os.path.join(configs_dir, existing))
+                except Exception:
+                    pass
+        if not os.listdir(configs_dir):
+            try:
+                os.rmdir(configs_dir)
+            except Exception:
+                pass
+
+    return saved_records, all_interfaces, pasteable_configs
+
+def get_node_friendly_details(n):
+    ntype = n.get("node_type", "guest")
+    props = n.get("properties") or {}
+    hda = props.get("hda_disk_image") or ""
+    ram = props.get("ram")
+    cpus = props.get("cpus")
+    
+    ram_str = f"{ram} MB" if ram else "-"
+    cpu_str = f"{cpus}" if cpus else "-"
+    
+    type_str = ntype
+    img_str = "-"
+    
+    if "cisco" in hda.lower():
+        type_str = "Cisco Router (vIOS)"
+        img_str = hda
+    elif "vios_l2" in hda.lower():
+        type_str = "Cisco Switch (vIOS L2)"
+        img_str = hda
+    elif "arista" in hda.lower() or "veos" in hda.lower():
+        type_str = "Arista Switch (vEOS)"
+        img_str = hda
+    elif "junos" in hda.lower() or "juniper" in hda.lower():
+        type_str = "Juniper Router (vJunos)"
+        img_str = hda
+    elif "frr" in hda.lower():
+        type_str = "FRR Router (Linux)"
+        img_str = hda
+    elif "vyos" in hda.lower():
+        type_str = "VyOS Router"
+        img_str = hda
+    elif "debian" in hda.lower():
+        type_str = "Linux Server (Debian)"
+        img_str = hda
+    elif "ubuntu" in hda.lower():
+        type_str = "Linux Server (Ubuntu)"
+        img_str = hda
+    elif "kali" in hda.lower():
+        type_str = "Linux VM (Kali)"
+        img_str = hda
+    elif "freebsd" in hda.lower() or "opnsense" in hda.lower() or "pfsense" in hda.lower():
+        type_str = "BSD / Firewall VM"
+        img_str = hda
+    elif ntype == "ethernet_switch":
+        type_str = "Ethernet Switch"
+        img_str = "GNS3 Builtin"
+    elif ntype == "nat":
+        type_str = "NAT Gateway"
+        img_str = "GNS3 Builtin"
+    elif ntype == "vpcs":
+        type_str = "Virtual PC (VPCS)"
+        img_str = "VPCS"
+    elif hda:
+        type_str = f"VM ({ntype})"
+        img_str = hda
+        
+    return type_str, img_str, ram_str, cpu_str
+
+def device_sort_key(name):
+    n = name.lower()
+    if "r1" in n or ("-1" in n and "cisco" in n): return 1
+    if "r2" in n or ("-2" in n and "cisco" in n): return 2
+    if "r3" in n or ("-3" in n and "cisco" in n): return 3
+    if "cisco" in n or "router" in n or "junos" in n or "frr" in n: return 10
+    if "debian" in n or "ubuntu" in n or "linux" in n: return 20
+    if "switch" in n: return 30
+    if "nat" in n: return 40
+    return 50
+
+def get_node_emoji(ntype, short):
+    nl = str(ntype).lower()
+    sl = str(short).lower()
+    if "cisco" in nl or "router" in nl or "junos" in nl or "vyos" in nl or sl.startswith("r"):
+        return "🖥️"
+    elif "switch" in nl:
+        return "🌐"
+    elif "nat" in nl or "firewall" in nl or "pfsense" in nl or "opnsense" in nl:
+        return "🛡️"
+    elif "debian" in nl or "ubuntu" in nl or "linux" in nl or "kali" in nl:
+        return "🐧"
+    elif "vpcs" in nl or "pc" in nl:
+        return "💻"
+    return "📦"
+
+def translate_to_english(text):
+    if not text or text == "-":
+        return text
+    translations = [
+        (r'\bStatisk IP mot\b', 'Static IP to'),
+        (r'\bstatisk ip mot\b', 'static IP to'),
+        (r'\bStatisk IP-konfiguration mot\b', 'Static IP configuration to'),
+        (r'\bstatisk ip-konfiguration mot\b', 'static IP configuration to'),
+        (r'\bStatisk IP till\b', 'Static IP to'),
+        (r'\bstatisk ip till\b', 'static IP to'),
+        (r'\bStatisk IP\b', 'Static IP'),
+        (r'\bstatisk ip\b', 'static IP'),
+        (r'\bDynamisk IP mot\b', 'Dynamic IP to'),
+        (r'\bdynamisk ip mot\b', 'dynamic IP to'),
+        (r'\bDynamisk IP till\b', 'Dynamic IP to'),
+        (r'\bdynamisk ip till\b', 'dynamic IP to'),
+        (r'\bLänk mot\b', 'Link to'),
+        (r'\blänk mot\b', 'link to'),
+        (r'\bLänk till\b', 'Link to'),
+        (r'\blänk till\b', 'link to'),
+        (r'\bAnsluten mot\b', 'Connected to'),
+        (r'\bansluten mot\b', 'connected to'),
+        (r'\bAnsluten till\b', 'Connected to'),
+        (r'\bansluten till\b', 'connected to'),
+        (r'\bAnslutning mot\b', 'Connection to'),
+        (r'\banslutning mot\b', 'connection to'),
+        (r'\bAnslutning till\b', 'Connection to'),
+        (r'\banslutning till\b', 'connection to'),
+        (r'\bmot\b', 'to'),
+        (r'\bMot\b', 'To'),
+        (r'\btill\b', 'to'),
+        (r'\bTill\b', 'To'),
+        (r'\bfrån\b', 'from'),
+        (r'\bFrån\b', 'From'),
+        (r'\bför\b', 'for'),
+        (r'\bFör\b', 'For'),
+        (r'\blabb\b', 'lab'),
+        (r'\bLabb\b', 'Lab'),
+        (r'\bavstängd\b', 'disabled'),
+        (r'\bAvstängd\b', 'Disabled'),
+        (r'\bnedkopplad\b', 'disconnected'),
+        (r'\bNedkopplad\b', 'Disconnected'),
+        (r'\binternt nätverk\b', 'internal network'),
+        (r'\bInternt nätverk\b', 'Internal network'),
+        (r'\binternt nät\b', 'internal network'),
+        (r'\bInternt nät\b', 'Internal network'),
+        (r'\bstamnät\b', 'backbone network'),
+        (r'\bStamnät\b', 'Backbone network'),
+    ]
+    res = text
+    for pattern, repl in translations:
+        res = re.sub(pattern, repl, res)
+    return res
+
+def get_node_clean_presentation(node, all_ifs):
+    raw_name = node.get("name", "Node")
+    hostname = None
+    for i in all_ifs:
+        if i["node"] == raw_name or raw_name in i["node"]:
+            m = re.search(r"\(`([A-Za-z0-9_\-]+)`\)", i["node"])
+            if m:
+                hostname = m.group(1)
+                break
+    
+    if hostname:
+        short = hostname
+    elif "cisco" in raw_name.lower():
+        m = re.search(r"-(\d+)", raw_name)
+        short = f"R{m.group(1)}" if m else raw_name
+    elif "debian" in raw_name.lower():
+        m = re.search(r"-(\d+)", raw_name)
+        short = f"Debian-{m.group(1)}" if m else raw_name
+    elif "ubuntu" in raw_name.lower():
+        m = re.search(r"-(\d+)", raw_name)
+        short = f"Ubuntu-{m.group(1)}" if m else raw_name
+    else:
+        short = raw_name
+        
+    ntype, _, _, _ = get_node_friendly_details(node)
+    if "cisco" in ntype.lower():
+        plat_label = "Cisco IOS"
+    elif "junos" in ntype.lower():
+        plat_label = "vJunos"
+    elif "arista" in ntype.lower():
+        plat_label = "vEOS"
+    elif "linux" in ntype.lower() or "debian" in ntype.lower():
+        plat_label = "Linux Server"
+    elif "switch" in ntype.lower():
+        plat_label = "Ethernet Switch"
+    elif "nat" in ntype.lower():
+        plat_label = "NAT Gateway"
+    else:
+        plat_label = ntype
+        
+    emoji = get_node_emoji(ntype, short)
+    return short, f"{emoji} {short} ({plat_label})", emoji
+
+def generate_markdown(pdata, proj_disk_path, saved_records, all_interfaces, pasteable_configs, is_root=False, target_dir=None, cfg=None):
+    pname = pdata.get("name", "Unnamed")
+    proj_slug = sanitize_name(pname)
+    topo = pdata.get("topology", {})
+    nodes = topo.get("nodes", [])
+    links = topo.get("links", [])
+    drawings = topo.get("drawings", [])
+    
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+    primary_repo = cfg.get("repo_url", "") if cfg else ""
+    personal_repo = cfg.get("personal_repo_url", "") if cfg else ""
+    
+    web_primary_url = get_web_url_from_git_remote(primary_repo)
+    web_personal_url = get_web_url_from_git_remote(personal_repo) or web_primary_url
+    
+    repo_url = web_primary_url if is_root else web_personal_url
+    if not repo_url and cfg and cfg.get("repo_name"):
+        repo_url = f"https://github.com/username/{cfg['repo_name']}"
+
+    node_short_map = {}
+    node_label_map = {}
+    node_emoji_map = {}
+    name_to_short = {}
+    name_to_emoji = {}
+    for n in nodes:
+        nid = n.get("node_id")
+        raw_name = n.get("name", "node")
+        short, label, emoji = get_node_clean_presentation(n, all_interfaces)
+        node_short_map[nid] = short
+        node_label_map[nid] = label
+        node_emoji_map[nid] = emoji
+        name_to_short[raw_name] = short
+        name_to_emoji[raw_name] = emoji
+
+    def find_emoji(raw_name):
+        if raw_name in name_to_emoji:
+            return name_to_emoji[raw_name]
+        for k, v in name_to_emoji.items():
+            if k in raw_name or raw_name in k:
+                return v
+        return "🖥️"
+
+    node_to_fn = {r["node"]: r["filename"] for r in saved_records}
+
+    md = []
+    header_prefix = "#" if is_root else "##"
+    
+    # 1. Header Banner
+    if is_root:
+        md.append(f"{header_prefix} 🌐 GNS3Sync — Lab Topology & Disaster Recovery")
+        md.append("")
+        md.append(f"> **Lab Project:** `{pname}`  ")
+        md.append(f"> **Engine:** GNS3 on Linux KVM • **GitOps Engine:** GNS3Sync  ")
+        md.append(f"> **Last Synced:** `{now_str}` • **Status:** All {len(nodes)} nodes active and synchronized")
+    else:
+        md.append(f"{header_prefix} 🌐 {pname}")
+        md.append("")
+        md.append(f"**Last Synced:** `{now_str}`")
+    md.append("")
+    
+    # 2. Mermaid Topology Diagram with tasteful emojis
+    md.append(f"{header_prefix}# 🗺️ Network Topology")
+    md.append("")
+    if nodes:
+        md.append("```mermaid")
+        md.append("graph LR")
+        for n in sorted(nodes, key=lambda x: device_sort_key(x.get("name", ""))):
+            short = node_short_map.get(n.get("node_id"), n.get("name", "node"))
+            nid = sanitize_name(short)
+            label = node_label_map.get(n.get("node_id"), short)
+            clean_lbl = escape_mermaid(label)
+            md.append(f'    {nid}["{clean_lbl}"]')
+            
+        for l in links:
+            eps = l.get("nodes", [])
+            if len(eps) >= 2:
+                n1_id = eps[0].get("node_id")
+                n2_id = eps[1].get("node_id")
+                lbl1 = eps[0].get("label", {})
+                lbl2 = eps[1].get("label", {})
+                p1 = lbl1.get("text") if lbl1 else f"p{eps[0].get('adapter_number', 0)}"
+                p2 = lbl2.get("text") if lbl2 else f"p{eps[1].get('adapter_number', 0)}"
+                n1 = sanitize_name(node_short_map.get(n1_id, "n1"))
+                n2 = sanitize_name(node_short_map.get(n2_id, "n2"))
+                clean_edge = escape_mermaid(f"{p1} <--> {p2}")
+                md.append(f'    {n1} ---|"{clean_edge}"| {n2}')
+        md.append("```")
+    else:
+        md.append("*(No nodes currently created in this project)*")
+    md.append("")
+    
+    # 3. Canvas text drawings / IP plan (Protected Layout)
+    text_notes = []
+    for d in drawings:
+        for t in re.findall(r"<text[^>]*>(.*?)</text>", d.get("svg", ""), re.DOTALL):
+            clean = t.strip()
+            if clean:
+                text_notes.append(clean)
+                
+    if text_notes:
+        if len(text_notes) == 1 and "\n" not in text_notes[0] and len(text_notes[0]) < 60:
+            clean_tn = translate_to_english(text_notes[0])
+            md.append(f"{header_prefix}# 📝 Network Notes")
+            md.append("")
+            md.append(f"- `{clean_tn}`")
+            md.append("")
+        else:
+            md.append("<details>")
+            md.append(f"<summary>📝 <b>Canvas Notes & IP Addressing Plan ({len(text_notes)} annotations)</b> — <i>Click to expand</i></summary>")
+            md.append("<br>")
+            md.append("")
+            md.append("| # | Note / Annotation |")
+            md.append("| :---: | :--- |")
+            for idx, tn in enumerate(text_notes, 1):
+                clean_tn = translate_to_english(tn)
+                if "\n" in clean_tn:
+                    formatted = "<br>".join([f"<code>{re.escape(l.strip())}</code>" if l.strip() else "" for l in clean_tn.splitlines() if l.strip()])
+                else:
+                    formatted = f"`{clean_tn}`"
+                md.append(f"| {idx} | {formatted} |")
+            md.append("")
+            md.append("</details>")
+            md.append("")
+
+    # 4. Active Configured Interfaces & IP Table
+    if all_interfaces:
+        md.append(f"{header_prefix}# 📋 Configured Interfaces & IP Addressing")
+        md.append("")
+        md.append("| Device | Interface | IP Address (IPv4 / IPv6) | Description / Notes | Port Status |")
+        md.append("| :--- | :--- | :--- | :--- | :--- |")
+        for i in sorted(all_interfaces, key=lambda x: (device_sort_key(x["node"]), x["name"])):
+            ips = []
+            if i["ipv4"]:
+                ips.extend(i["ipv4"])
+            if i["ipv6"]:
+                ips.extend(i["ipv6"])
+            ip_str = "<br>".join([f"`{ip}`" for ip in ips]) if ips else "*unassigned*"
+            if i.get("name") in ["(All ports)", "(Alla portar)"]:
+                if "commit" in i.get("desc", "").lower():
+                    status_badge = "🟡 Pending commit"
+                elif "vtysh" in i.get("desc", "").lower():
+                    status_badge = "🟡 Pending vtysh wr"
+                else:
+                    status_badge = "🟡 Pending wr"
+            else:
+                status_badge = "🔴 Down" if i["shutdown"] else "🟢 Up"
+            
+            desc_clean = translate_to_english(i['desc']).replace("|", "&#124;")
+            desc_str = f"`{desc_clean}`" if desc_clean != "-" else "-"
+            
+            raw_node = i['node']
+            short_dev = raw_node
+            for raw_name, sname in name_to_short.items():
+                if raw_name in raw_node or raw_node in raw_name:
+                    short_dev = sname
+                    break
+            
+            dev_emoji = find_emoji(raw_node)
+            name_clean = i['name'].replace("|", "&#124;")
+            md.append(f"| {dev_emoji} **{short_dev}** | `{name_clean}` | {ip_str} | {desc_str} | {status_badge} |")
+        md.append("")
+
+    # 5. Quick-Restore & Rollback Device Cards
+    if pasteable_configs:
+        md.append(f"{header_prefix}# ⚡ Disaster Recovery & 1-Click Rollback")
+        md.append("")
+        md.append("> [!NOTE]")
+        md.append("> **How to restore a node or rollback configuration:**")
+        md.append("> 1. Click on any device card below to expand its configuration.")
+        md.append("> 2. **To apply current active state:** Open **Active Configuration** and paste into console.")
+        md.append("> 3. **To rollback 1 step:** Open **Rollback to Previous Version** and paste into console with **zero scrolling**.")
+        md.append(">")
+        md.append("> 💡 **Cisco & Arista Note:** Running configuration changes are saved to persistent NVRAM only upon running `write memory` (or shorthand `wr`). Always execute `wr` before closing a lab session so the latest state is archived.")
+        md.append("")
+
+        # Group pasteable configs by node
+        node_to_configs = {}
+        for pc in pasteable_configs:
+            node_to_configs.setdefault(pc["node"], []).append(pc)
+            
+        for nname in sorted(node_to_configs.keys(), key=device_sort_key):
+            cfgs_for_node = node_to_configs[nname]
+            short_dev = name_to_short.get(nname, nname)
+            dev_emoji = find_emoji(nname)
+
+            dev_ips = []
+            for i in all_interfaces:
+                if i["node"] == nname or nname in i["node"]:
+                    for ip in (i.get("ipv4", []) + i.get("ipv6", [])):
+                        if ip and ip not in dev_ips and "Waiting" not in ip and "Pending" not in ip:
+                            dev_ips.append(ip)
+            ip_badge = f"`{dev_ips[0]}`" if dev_ips else "*unassigned*"
+            
+            # Case 1: Single configuration file on this node
+            if len(cfgs_for_node) == 1:
+                pc = cfgs_for_node[0]
+                platform = pc.get("platform", "Device")
+                ctype = pc["type"]
+                ptype = pc.get("platform_type", "text")
+                cfg_body = pc["config"]
+                fn = pc.get("filename")
+                raw_cfg = pc.get("raw_config", "")
+                
+                history_url = f"{repo_url}/commits/main/configs/{fn}" if is_root else f"{repo_url}/commits/main/projects/{proj_slug}/configs/{fn}"
+                raw_link = f"configs/{fn}" if fn else ""
+
+                md.append("<details>")
+                md.append(f"<summary>{dev_emoji} <b>{short_dev}</b> &nbsp;│&nbsp; {ip_badge} &nbsp;│&nbsp; {platform}</summary>")
+                md.append("<br>")
+                md.append("")
+                if fn:
+                    md.append(f"> [📄 Open Raw Config (`{fn}`)]({raw_link}) &nbsp;│&nbsp; [📜 View Commit History on GitHub]({history_url})")
+                    md.append("")
+
+                # Nested Active Configuration Accordion
+                md.append("<details>")
+                md.append("<summary>📋 <b>Active Configuration (1-Click Apply)</b></summary>")
+                md.append("")
+                md.append(f"```{ctype}")
+                md.append(cfg_body)
+                md.append("```")
+                md.append("")
+                md.append("</details>")
+                md.append("")
+
+                # Nested Rollback Accordion
+                if fn and target_dir:
+                    prev_info = get_previous_config(target_dir, f"configs/{fn}", raw_cfg)
+                    if prev_info:
+                        p_commit = prev_info["commit"]
+                        p_date = prev_info["date"]
+                        diff_url = f"{repo_url}/commit/{p_commit}" if is_root else f"{repo_url}/commit/{p_commit}"
+                        prev_lang, prev_snippet = build_pasteable_snippet(ptype, nname, pname, prev_info["raw"], is_rollback=True, commit_hash=p_commit, commit_date=p_date, target_path=pc.get("target_path"))
+                        
+                        md.append("<details>")
+                        md.append("<summary>⏪ <b>Rollback to Previous Version (1 Step Back)</b></summary>")
+                        md.append("")
+                        md.append(f"> 🔄 **Previous Revision:** `{p_commit}` &nbsp;│&nbsp; **Saved:** `{p_date}` &nbsp;│&nbsp; [🔍 View Commit Diff on GitHub]({diff_url})")
+                        md.append("")
+                        md.append(f"```{prev_lang}")
+                        md.append(prev_snippet)
+                        md.append("```")
+                        md.append("")
+                        md.append("</details>")
+                    else:
+                        md.append("<details>")
+                        md.append("<summary>⏪ <b>Rollback to Previous Version (Initial Revision)</b></summary>")
+                        md.append("")
+                        md.append("> ℹ️ *Initial revision — no previous configuration recorded in Git yet. Use Active Configuration above.*")
+                        md.append("")
+                        md.append("</details>")
+                else:
+                    md.append("<details>")
+                    md.append("<summary>⏪ <b>Rollback to Previous Version</b></summary>")
+                    md.append("")
+                    md.append("> ℹ️ *No archived revisions available.*")
+                    md.append("")
+                    md.append("</details>")
+                md.append("")
+                md.append("</details>")
+                md.append("")
+
+            # Case 2: Multiple configuration files on this node
+            else:
+                main_plat = cfgs_for_node[0].get("platform", "Linux Server")
+                if "linux" in main_plat.lower() or "interfaces" in main_plat.lower():
+                    main_plat = "Linux Server"
+                
+                md.append("<details>")
+                md.append(f"<summary>{dev_emoji} <b>{short_dev}</b> &nbsp;│&nbsp; {ip_badge} &nbsp;│&nbsp; {main_plat} &nbsp;({len(cfgs_for_node)} configs)</summary>")
+                md.append("<br>")
+                md.append("")
+
+                for pc in cfgs_for_node:
+                    svc_title = pc.get("service_title", pc.get("platform", "Configuration"))
+                    t_path = pc.get("target_path", "")
+                    path_badge = f" &nbsp;│&nbsp; <code>{t_path}</code>" if t_path else ""
+                    fn = pc.get("filename")
+                    ctype = pc["type"]
+                    ptype = pc.get("platform_type", "text")
+                    cfg_body = pc["config"]
+                    raw_cfg = pc.get("raw_config", "")
+                    
+                    history_url = f"{repo_url}/commits/main/configs/{fn}" if is_root else f"{repo_url}/commits/main/projects/{proj_slug}/configs/{fn}"
+                    raw_link = f"configs/{fn}" if fn else ""
+
+                    md.append("<details>")
+                    md.append(f"<summary>📋 <b>{svc_title}</b>{path_badge}</summary>")
+                    md.append("<br>")
+                    md.append("")
+                    if fn:
+                        md.append(f"> [📄 Open Raw File (`{fn}`)]({raw_link}) &nbsp;│&nbsp; [📜 View Commit History on GitHub]({history_url})")
+                        md.append("")
+
+                    # Active Configuration for this service
+                    md.append("<details>")
+                    md.append("<summary>📋 <b>Active Configuration (1-Click Apply)</b></summary>")
+                    md.append("")
+                    md.append(f"```{ctype}")
+                    md.append(cfg_body)
+                    md.append("```")
+                    md.append("")
+                    md.append("</details>")
+                    md.append("")
+
+                    # Rollback for this service
+                    if fn and target_dir:
+                        prev_info = get_previous_config(target_dir, f"configs/{fn}", raw_cfg)
+                        if prev_info:
+                            p_commit = prev_info["commit"]
+                            p_date = prev_info["date"]
+                            diff_url = f"{repo_url}/commit/{p_commit}" if is_root else f"{repo_url}/commit/{p_commit}"
+                            prev_lang, prev_snippet = build_pasteable_snippet(ptype, nname, pname, prev_info["raw"], is_rollback=True, commit_hash=p_commit, commit_date=p_date, target_path=t_path)
+                            
+                            md.append("<details>")
+                            md.append("<summary>⏪ <b>Rollback to Previous Version (1 Step Back)</b></summary>")
+                            md.append("")
+                            md.append(f"> 🔄 **Previous Revision:** `{p_commit}` &nbsp;│&nbsp; **Saved:** `{p_date}` &nbsp;│&nbsp; [🔍 View Commit Diff on GitHub]({diff_url})")
+                            md.append("")
+                            md.append(f"```{prev_lang}")
+                            md.append(prev_snippet)
+                            md.append("```")
+                            md.append("")
+                            md.append("</details>")
+                        else:
+                            md.append("<details>")
+                            md.append("<summary>⏪ <b>Rollback to Previous Version (Initial Revision)</b></summary>")
+                            md.append("")
+                            md.append("> ℹ️ *Initial revision — no previous configuration recorded in Git yet. Use Active Configuration above.*")
+                            md.append("")
+                            md.append("</details>")
+                    else:
+                        md.append("<details>")
+                        md.append("<summary>⏪ <b>Rollback to Previous Version</b></summary>")
+                        md.append("")
+                        md.append("> ℹ️ *No archived revisions available.*")
+                        md.append("")
+                        md.append("</details>")
+                    md.append("")
+                    md.append("</details>")
+                    md.append("")
+
+                md.append("</details>")
+                md.append("")
+# 6. Node Inventory Table
+    md.append(f"{header_prefix}# 🗄️ Equipment Inventory")
+    md.append("")
+    if nodes:
+        md.append("| Device | Primary IP | Hardware Resources | Device Type | Saved Config & History |")
+        md.append("| :--- | :--- | :--- | :--- | :--- |")
+        for n in sorted(nodes, key=lambda x: device_sort_key(x.get("name", ""))):
+            raw_nname = n.get("name", "Unnamed")
+            short = name_to_short.get(raw_nname, raw_nname)
+            ntype, img, ram, cpus = get_node_friendly_details(n)
+            dev_emoji = find_emoji(raw_nname)
+            
+            node_ips = []
+            for i in all_interfaces:
+                if i["node"] == raw_nname or i["node"].startswith(f"{raw_nname} ") or raw_nname in i["node"]:
+                    for ip in (i.get("ipv4", []) + i.get("ipv6", [])):
+                        if ip and ip not in node_ips and "Waiting" not in ip and "Pending" not in ip:
+                            node_ips.append(ip)
+            ip_col = "<br>".join([f"`{ip}`" for ip in node_ips]) if node_ips else "*L2 Bridge / Gateway*"
+
+            node_records = [r for r in saved_records if r["node"] == raw_nname]
+            if node_records:
+                if len(node_records) == 1:
+                    fn = node_records[0]["filename"]
+                    history_url = f"{repo_url}/commits/main/configs/{fn}" if is_root else f"{repo_url}/commits/main/projects/{proj_slug}/configs/{fn}"
+                    hist_col = f"[`Config`](configs/{fn}) │ [`History`]({history_url})"
+                else:
+                    links_part = []
+                    for idx, r in enumerate(node_records, 1):
+                        fn = r["filename"]
+                        stitle = r.get("service_title", f"Config {idx}")
+                        links_part.append(f"[`{stitle}`](configs/{fn})")
+                    hist_col = "<br>".join(links_part)
+            else:
+                hist_col = "-"
+                
+            res_str = f"{ram} / {cpus} vCPU" if (ram != "-" and cpus != "-") else (ram if ram != "-" else "Built-in")
+            md.append(f"| {dev_emoji} **{short}** | {ip_col} | {res_str} | `{ntype}` | {hist_col} |")
+    else:
+        md.append("*(No nodes in this project)*")
+    md.append("")
+    
+    # 7. Cabling & Links
+    md.append(f"{header_prefix}# 🔌 Physical Cabling & Interconnects")
+    md.append("")
+    if links:
+        md.append("| From Device | Port | Link Type | Port | To Device |")
+        md.append("| :--- | :---: | :---: | :---: | :--- |")
+        for l in links:
+            eps = l.get("nodes", [])
+            ltype = "Ethernet" if l.get("link_type", "ethernet") == "ethernet" else l.get("link_type")
+            if len(eps) >= 2:
+                n1_id = eps[0].get("node_id")
+                n2_id = eps[1].get("node_id")
+                n1_name = node_short_map.get(n1_id, "Unknown")
+                n2_name = node_short_map.get(n2_id, "Unknown")
+                n1_emoji = node_emoji_map.get(n1_id, "🖥️")
+                n2_emoji = node_emoji_map.get(n2_id, "🖥️")
+                lbl1 = eps[0].get("label", {})
+                lbl2 = eps[1].get("label", {})
+                p1 = lbl1.get("text") if lbl1 else f"Port {eps[0].get('adapter_number', 0)}"
+                p2 = lbl2.get("text") if lbl2 else f"Port {eps[1].get('adapter_number', 0)}"
+                md.append(f"| {n1_emoji} **{n1_name}** | `{p1}` | {ltype} | `{p2}` | {n2_emoji} **{n2_name}** |")
+    else:
+        md.append("*(No physical links connected yet)*")
+    md.append("")
+    
+    # 8. Saved Configurations Table
+    md.append(f"{header_prefix}# 💾 Archived Configuration Files")
+    md.append("")
+    if saved_records:
+        md.append("| Target Device | Filename | Platform Type | Git Commit History |")
+        md.append("| :--- | :--- | :--- | :--- |")
+        for r in sorted(saved_records, key=lambda x: device_sort_key(x["node"])):
+            fn = r["filename"]
+            raw_dev = r["node"]
+            short_dev = name_to_short.get(raw_dev, raw_dev)
+            dev_emoji = find_emoji(raw_dev)
+            history_url = f"{repo_url}/commits/main/configs/{fn}" if is_root else f"{repo_url}/commits/main/projects/{proj_slug}/configs/{fn}"
+            md.append(f"| {dev_emoji} **{short_dev}** | [`{fn}`](configs/{fn}) | {r['type']} | [`Commit History`]({history_url}) |")
+    else:
+        md.append("*(No configuration files saved in this project yet)*")
+    md.append("")
+    return "\n".join(md)
+
+def git_sync_repo(repo_dir, commit_msg):
+    os.chdir(repo_dir)
+    # Pull incoming changes from group members first
+    remotes = subprocess.run(["git", "remote"], capture_output=True, text=True).stdout
+    if "origin" in remotes:
+        pull_res = subprocess.run(["git", "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
+        if pull_res.returncode != 0:
+            # Rebase conflict safeguard: abort rebase to leave repo in clean state
+            subprocess.run(["git", "rebase", "--abort"], capture_output=True)
+
+    subprocess.run(["git", "add", "."], capture_output=True)
+    res = subprocess.run(["git", "status", "-s"], capture_output=True, text=True)
+    if res.stdout.strip():
+        subprocess.run(["git", "commit", "-m", commit_msg], capture_output=True)
+        print(f"[{os.path.basename(repo_dir)}] Created git commit: {commit_msg}")
+    
+    # Check if we have commits to push (either new commit or unpushed prior commits)
+    if "origin" in remotes:
+        ahead_check = subprocess.run(["git", "status", "-sb"], capture_output=True, text=True).stdout
+        if "ahead" in ahead_check or res.stdout.strip():
+            print(f"[{os.path.basename(repo_dir)}] Pushing to GitHub...")
+            push_res = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
+            if push_res.returncode != 0:
+                # Retry with pull rebase if remote has new commits
+                subprocess.run(["git", "pull", "--rebase", "origin", "main"], capture_output=True)
+                push_res = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
+            if push_res.returncode == 0:
+                print(f"[{os.path.basename(repo_dir)}] Push to GitHub completed successfully! 🚀")
+            else:
+                print(f"[{os.path.basename(repo_dir)}] Push failed: {push_res.stderr.strip()}")
+        else:
+            print(f"[{os.path.basename(repo_dir)}] Working tree clean, nothing new to push.")
+    else:
+        print(f"[{os.path.basename(repo_dir)}] Note: Git remote origin is not configured.")
+
+
+
+def save_config_keywords(config_path, new_keyword):
+    if not os.path.isfile(config_path):
+        return
+    with open(config_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    new_lines = []
+    in_kw = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("project_keywords:"):
+            in_kw = True
+            new_lines.append(line)
+            new_lines.append(f"  - \"{new_keyword}\"\n")
+            continue
+        if in_kw:
+            if s.startswith("-"):
+                continue
+            elif s and not s.startswith("#"):
+                in_kw = False
+                new_lines.append(line)
+            else:
+                new_lines.append(line)
+        else:
+            new_lines.append(line)
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
+
+def get_all_projects_detailed(projects_dir):
+    projects = []
+    if not os.path.isdir(projects_dir):
+        return projects
+    for d in sorted(os.listdir(projects_dir)):
+        if d.startswith(".") or d.startswith("backup"):
+            continue
+        pdir = os.path.join(projects_dir, d)
+        if not os.path.isdir(pdir):
+            continue
+        gns3_files = [f for f in os.listdir(pdir) if f.endswith(".gns3")]
+        if not gns3_files:
+            continue
+        gns3_path = os.path.join(pdir, gns3_files[0])
+        try:
+            with open(gns3_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            name = data.get("name", d)
+            projects.append({"id": d, "name": name, "file": gns3_files[0], "dir": pdir})
+        except Exception:
+            projects.append({"id": d, "name": d, "file": "", "dir": pdir})
+    return projects
+
+def cmd_list(cfg):
+    projects = get_all_projects_detailed(cfg["projects_dir"])
+    if not projects:
+        print(f"No GNS3 projects found in {cfg['projects_dir']}.")
+        return
+    keywords = [k.lower() for k in cfg.get("project_keywords", [])]
+    print(f"\n=== GNS3 Projects in {cfg['projects_dir']} ===")
+    for idx, p in enumerate(projects, 1):
+        is_active = any(k in p["name"].lower() for k in keywords)
+        mark = "🟢 [ACTIVE ON GITHUB]" if is_active else "⚪"
+        print(f"  {idx:2d}) {mark:22} {p['name']}")
+    print("=" * 55)
+    print(f"Active project keyword(s): {keywords}\n")
+
+def cmd_switch(cfg, target_arg=None):
+    projects = get_all_projects_detailed(cfg["projects_dir"])
+    if not projects:
+        print(f"No GNS3 projects found in {cfg['projects_dir']}.")
+        return
+    keywords = [k.lower() for k in cfg.get("project_keywords", [])]
+    
+    target_project = None
+    if target_arg:
+        if target_arg.isdigit():
+            idx = int(target_arg) - 1
+            if 0 <= idx < len(projects):
+                target_project = projects[idx]
+        else:
+            matches = [p for p in projects if target_arg.lower() in p["name"].lower() or target_arg.lower() in p["id"].lower()]
+            if len(matches) == 1:
+                target_project = matches[0]
+            elif len(matches) > 1:
+                print(f"Multiple projects match '{target_arg}':")
+                for p in matches:
+                    print(f" - {p['name']}")
+                print("Please specify a more unique name or index number.")
+                return
+    
+    if not target_project:
+        print(f"\n=== Select GNS3 Project to Sync to GitHub ===")
+        for idx, p in enumerate(projects, 1):
+            is_active = any(k in p["name"].lower() for k in keywords)
+            mark = "🟢 [ACTIVE]" if is_active else "⚪"
+            print(f"  {idx:2d}) {mark:12} {p['name']}")
+        print("=" * 55)
+        try:
+            choice = input("Enter number or project name (q to cancel): ").strip()
+            if not choice or choice.lower() in ["q", "quit", "exit"]:
+                print("Cancelled.")
+                return
+            if choice.isdigit():
+                idx = int(choice) - 1
+                if 0 <= idx < len(projects):
+                    target_project = projects[idx]
+            else:
+                matches = [p for p in projects if choice.lower() in p["name"].lower()]
+                if len(matches) == 1:
+                    target_project = matches[0]
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.")
+            return
+
+    if not target_project:
+        print("No project selected.")
+        return
+
+    print(f"\nSwitching active project to: {target_project['name']}")
+    config_file = cfg.get("_loaded_from")
+    if not config_file:
+        config_file = os.path.expanduser("~/.config/gns3sync/config.yaml")
+        
+    clean_kw = target_project["name"].lower()
+    cfg["project_keywords"] = [clean_kw]
+    
+    save_config_keywords(config_file, clean_kw)
+    print(f"Updated configuration: {config_file}")
+    
+    export_configs_dir = os.path.join(cfg["export_dir"], "configs")
+    if os.path.isdir(export_configs_dir):
+        for f in os.listdir(export_configs_dir):
+            fp = os.path.join(export_configs_dir, f)
+            try:
+                if os.path.isfile(fp) or os.path.islink(fp):
+                    os.unlink(fp)
+                elif os.path.isdir(fp):
+                    shutil.rmtree(fp)
+            except Exception:
+                pass
+                
+    sync_engine(cfg)
+
+def cmd_init():
+    """Interactive CLI wizard to configure GNS3Sync for a new environment."""
+    print("==================================================")
+    print("       GNS3Sync Interactive Setup Wizard          ")
+    print("==================================================")
+    detected_pdir = auto_detect_projects_dir()
+            
+    pdir_input = input(f"Path to GNS3 projects directory [{detected_pdir}]: ").strip()
+    pdir = pdir_input or detected_pdir
+    
+    default_export = os.path.expanduser("~/gns3-export")
+    export_input = input(f"Local path for Git export repository [{default_export}]: ").strip()
+    export_dir = os.path.abspath(os.path.expanduser(export_input or default_export))
+    
+    repo_input = input("Remote GitHub URL (SSH or HTTPS, e.g. git@github.com:user/my-lab.git): ").strip()
+    repo_url = repo_input
+    repo_name = os.path.basename(repo_url).replace(".git", "") if repo_url else "gns3-topology"
+    
+    keyword_input = input("Primary project keyword/name (leave empty for auto-detect): ").strip()
+    keywords = [keyword_input] if keyword_input else ["main", "lab"]
+    
+    enable_dual = input("Enable Dual-Sync (backup all secondary labs to archive/ folder)? [Y/n]: ").strip().lower()
+    dual_sync = enable_dual != "n"
+    personal_export = os.path.join(export_dir, "archive") if dual_sync else ""
+    
+    cfg_data = {
+        "projects_dir": pdir,
+        "export_dir": os.path.join(export_dir, "primary") if dual_sync else export_dir,
+        "repo_url": repo_url,
+        "repo_name": repo_name,
+        "project_keywords": keywords,
+        "auto_push": True
+    }
+    if personal_export:
+        cfg_data["personal_export_dir"] = personal_export
+    
+    # Save config
+    cfg_dir = os.path.expanduser("~/.config/gns3sync")
+    os.makedirs(cfg_dir, exist_ok=True)
+    out_cfg = os.path.join(cfg_dir, "config.yaml")
+    
+    if yaml:
+        with open(out_cfg, "w") as f:
+            yaml.dump(cfg_data, f, default_flow_style=False)
+    else:
+        with open(out_cfg, "w") as f:
+            for k, v in cfg_data.items():
+                if isinstance(v, list):
+                    f.write(f"{k}:\n")
+                    for item in v:
+                        f.write(f"  - \"{item}\"\n")
+                else:
+                    f.write(f"{k}: \"{v}\"\n" if isinstance(v, str) else f"{k}: {v}\n")
+                
+    print(f"\n✅ Configuration successfully created at {out_cfg}!")
+    print("Next steps:")
+    print("  1. Run 'gns3sync status' to verify environment health.")
+    print("  2. Run 'gns3sync switch' to choose your active project.")
+    print("  3. Run 'gns3sync sync' to run your first GitOps export & push.")
+
+def check_cmd(cmd_name):
+    return shutil.which(cmd_name) is not None
+
+def cmd_status(cfg):
+    """Prints current GNS3Sync status and diagnostics."""
+    print("==================================================")
+    print("               GNS3Sync Status Check              ")
+    print("==================================================")
+    print(f"Config Source:      {cfg.get('_loaded_from', 'Built-in Defaults')}")
+    print(f"Projects Directory: {cfg['projects_dir']} (\033[92mExists\033[0m)" if os.path.isdir(cfg['projects_dir']) else f"Projects Directory: {cfg['projects_dir']} (\033[91mMISSING\033[0m)")
+    print(f"Export Directory:   {cfg['export_dir']}")
+    print(f"Remote Git Repo:    {cfg.get('repo_url') or 'Not configured'}")
+    print(f"Active Keywords:    {cfg.get('project_keywords', [])}")
+    print("-" * 50)
+    print("Dependency Check:")
+    print(f"  • Python 3:       \033[92m{sys.version.split()[0]}\033[0m")
+    print(f"  • Git:            " + ("\033[92mFound\033[0m" if check_cmd("git") else "\033[91mMissing (install git)\033[0m"))
+    print(f"  • qemu-nbd:       " + ("\033[92mFound\033[0m" if check_cmd("qemu-nbd") else "\033[93mMissing (optional for QEMU disk inspection: apt install qemu-utils)\033[0m"))
+    print(f"  • strings:        " + ("\033[92mFound\033[0m" if check_cmd("strings") else "\033[93mMissing (optional for Cisco NVRAM: apt install binutils)\033[0m"))
+    print(f"  • PyYAML:         " + ("\033[92mInstalled\033[0m" if yaml else "\033[93mUsing built-in fallback parser\033[0m"))
+    
+    if os.path.isdir(cfg['projects_dir']):
+        projects = get_all_projects_detailed(cfg['projects_dir'])
+        print("-" * 50)
+        print(f"Detected Projects:  {len(projects)}")
+        for idx, p in enumerate(projects[:5], 1):
+            is_active = any(k in p["name"].lower() for k in [kw.lower() for kw in cfg.get("project_keywords", [])])
+            mark = "🟢" if is_active else "⚪"
+            print(f"  {mark} {p['name']}")
+        if len(projects) > 5:
+            print(f"  ... and {len(projects) - 5} more (run 'gns3sync list' for full list)")
+    print("==================================================")
+
+def sync_engine(cfg):
+    """Executes full multi-vendor synchronization."""
+    print("=== GNS3Sync GitOps Engine ===")
+    export_dir = cfg["export_dir"]
+    personal_dir = cfg.get("personal_export_dir", "")
+    projects_dir = cfg["projects_dir"]
+    
+    fix_export_ownership(export_dir)
+    os.makedirs(export_dir, exist_ok=True)
+    if personal_dir:
+        fix_export_ownership(personal_dir)
+        os.makedirs(os.path.join(personal_dir, "projects"), exist_ok=True)
+    
+    if not os.path.isdir(projects_dir):
+        print(f"Error: projects directory '{projects_dir}' does not exist.")
+        return
+        
+    project_dirs = [
+        os.path.join(projects_dir, d) 
+        for d in os.listdir(projects_dir) 
+        if os.path.isdir(os.path.join(projects_dir, d)) 
+        and not d.startswith('.') 
+        and not d.startswith('backup')
+    ]
+    
+    stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
+    personal_index = [
+        "# Private GNS3 Lab Portfolio",
+        "",
+        f"Automated backup and documentation repository for personal networking labs, topologies, and multi-vendor configurations. Last Synced: `{stamp}`",
+        "",
+        "## Projects Overview",
+        "",
+        "| Project | Nodes | Links | Configurations | Link |",
+        "| :--- | :--- | :--- | :--- | :--- |"
+    ]
+    
+    for pdir in sorted(project_dirs):
+        gns3_files = [f for f in os.listdir(pdir) if f.endswith(".gns3")]
+        if not gns3_files:
+            continue
+            
+        gns3_path = os.path.join(pdir, gns3_files[0])
+        try:
+            with open(gns3_path, "r", encoding="utf-8") as f:
+                pdata = json.load(f)
+        except Exception as e:
+            print(f"Could not read {gns3_path}: {e}")
+            continue
+            
+        pname = pdata.get("name", os.path.basename(pdir))
+        sname = sanitize_name(pname)
+        topo = pdata.get("topology", {})
+        nodes = topo.get("nodes", [])
+        links = topo.get("links", [])
+        
+        if is_group_project(pname):
+            # Primary Lab Export
+            shutil.copy2(gns3_path, os.path.join(export_dir, "topology.gns3"))
+            saved_records, all_ifs, pasteables = export_configs(pdir, export_dir, nodes, pname)
+            doc = generate_markdown(pdata, pdir, saved_records, all_ifs, pasteables, is_root=True, target_dir=export_dir, cfg=cfg)
+            with open(os.path.join(export_dir, "README.md"), "w", encoding="utf-8") as f:
+                f.write(doc)
+            print(f"[GNS3Sync] Exported primary lab '{pname}' ({len(saved_records)} configs) -> {export_dir}")
+        elif personal_dir:
+            # Secondary / Personal Labs Export
+            target_dir = os.path.join(personal_dir, "projects", sname)
+            os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(gns3_path, os.path.join(target_dir, "topology.gns3"))
+            saved_records, all_ifs, pasteables = export_configs(pdir, target_dir, nodes, pname)
+            doc = generate_markdown(pdata, pdir, saved_records, all_ifs, pasteables, is_root=False, target_dir=target_dir, cfg=cfg)
+            with open(os.path.join(target_dir, "README.md"), "w", encoding="utf-8") as f:
+                f.write(doc)
+                
+            cfg_badge = f"{len(saved_records)} files" if saved_records else "None saved"
+            personal_index.append(f"| **{pname}** | {len(nodes)} | {len(links)} | {cfg_badge} | [Open Project](projects/{sname}/) |")
+            print(f"[GNS3Sync] Exported lab '{pname}' ({len(saved_records)} configs) -> personal/projects/{sname}/")
+            
+    if personal_dir:
+        with open(os.path.join(personal_dir, "README.md"), "w", encoding="utf-8") as f:
+            f.write("\n".join(personal_index))
+        
+    if cfg.get("auto_push", True):
+        print("\n--- Git Commit & Push ---")
+        git_sync_repo(export_dir, f"GNS3Sync auto-sync {stamp}")
+        if personal_dir and os.path.isdir(os.path.join(personal_dir, ".git")):
+            git_sync_repo(personal_dir, f"GNS3Sync personal labs auto-sync {stamp}")
+            
+    fix_export_ownership(export_dir)
+    if personal_dir:
+        fix_export_ownership(personal_dir)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GNS3Sync — Automated GitOps & Disaster Recovery documentation for GNS3 topologies",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  sync                 Run full GitOps synchronization and push to GitHub (default)
+  switch [project]     Switch primary active project (interactive or specify name/number)
+  list                 List all available GNS3 projects and mark active project
+  status               Check health, configuration, and dependencies
+  init                 Interactive setup wizard for new environments
+"""
+    )
+    parser.add_argument("command", nargs="?", default="sync", choices=["sync", "run", "switch", "list", "status", "init"], help="Command to execute (default: sync)")
+    parser.add_argument("target", nargs="?", default=None, help="Target project index or name (used with switch)")
+    parser.add_argument("--config", "-c", help="Path to custom config.yaml file")
+    args = parser.parse_args()
+    
+    if args.command == "init":
+        cmd_init()
+        return
+
+    cfg = load_config(args.config)
+    
+    if args.command in ["sync", "run"]:
+        sync_engine(cfg)
+    elif args.command == "switch":
+        cmd_switch(cfg, args.target)
+    elif args.command == "list":
+        cmd_list(cfg)
+    elif args.command == "status":
+        cmd_status(cfg)
+
+if __name__ == "__main__":
+    main()

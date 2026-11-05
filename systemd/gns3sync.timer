@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic GNS3Sync GitOps Synchronization
+After=network.target
+
+[Timer]
+# Run every 30 minutes
+OnCalendar=*:00/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

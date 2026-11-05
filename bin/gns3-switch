@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# GNS3-Switch — Fast Project Switcher for GNS3Sync
+# Usage:
+#   gns3-switch              (Interactive menu)
+#   gns3-switch list         (List all projects)
+#   gns3-switch <project>    (Direct switch by name or index)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If gns3sync is in the same directory, use it; otherwise search PATH
+if [[ -x "${SCRIPT_DIR}/gns3sync" ]]; then
+    GNS3SYNC_BIN="${SCRIPT_DIR}/gns3sync"
+elif command -v gns3sync >/dev/null 2>&1; then
+    GNS3SYNC_BIN="gns3sync"
+else
+    echo "Error: gns3sync binary not found in PATH or ${SCRIPT_DIR}" >&2
+    exit 1
+fi
+
+if [[ "$1" == "list" || "$1" == "-l" || "$1" == "--list" ]]; then
+    exec "${GNS3SYNC_BIN}" list
+else
+    exec "${GNS3SYNC_BIN}" switch "$@"
+fi

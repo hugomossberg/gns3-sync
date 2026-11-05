@@ -1,0 +1,12 @@
+[Unit]
+Description=GNS3Sync GitOps & Disaster Recovery Auto-Sync
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gns3sync sync
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
